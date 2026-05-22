@@ -668,9 +668,10 @@ function initSocket() {
     mySocketId = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
-      showToast(`✓ Rejoined room ${roomId} — reconnecting…`);
-      closeAllRoomPeers();          // clean slate
-      startRoomSession(true);
+      // Session already running — jump straight in and connect to everyone
+      showToast(`✓ ${roomId.includes('rejoin') ? 'Rejoined' : 'Joined'} room ${roomId} — connecting…`);
+      closeAllRoomPeers();          // clean slate for fresh connections
+      startRoomSession(true);       // isRejoin=true skips room_start emit
     } else {
       updateLobbyUI(members);
       showScreen('roomLobby');
@@ -687,9 +688,13 @@ function initSocket() {
     showToast(`🟢 ${name} joined`);
     updateRoomMemberCountDisplay();
 
-    if (sessionActive && screens.roomChat.classList.contains('active')) {
-      scheduleBuildRoomVideoLayout();
-      // Perfect Negotiation: just create the PC — onnegotiationneeded fires automatically
+    if (sessionActive) {
+      // Rebuild layout whether we are in lobby or chat screen
+      if (screens.roomChat.classList.contains('active')) {
+        scheduleBuildRoomVideoLayout();
+      }
+      // Connect to the new peer regardless — they will also connect back to us
+      // Perfect Negotiation ensures no collision
       connectToPeer(socketId);
     }
   });
@@ -761,6 +766,27 @@ function initSocket() {
 
   socket.on('room_message', ({ from, text }) => addRoomMessage(text, 'received', from));
 
+  // ── room_session_started: fires for ALL members when host clicks Start ──────
+  // This fixes the race: whether you joined early or late, everyone gets this event
+  socket.on('room_session_started', async ({ members, startedBy }) => {
+    roomMembers = members;
+    mySocketId  = socket.id;
+
+    // If we're still in lobby, move to chat screen
+    if (!screens.roomChat.classList.contains('active')) {
+      await getLocalMedia();
+      roomIdDisplay.textContent = currentRoomId;
+      showScreen('roomChat');
+      buildRoomVideoLayout();
+      reassignStreams();
+      addRoomSysMessage('Session started! Video connecting…');
+    }
+
+    // Connect to every other member — Perfect Negotiation handles offer/answer
+    const peers = roomMembers.filter(m => m.socketId !== mySocketId);
+    await Promise.all(peers.map(m => connectToPeer(m.socketId)));
+  });
+
   socket.on('room_member_media', ({ socketId, audioMuted, videoOff }) => {
     const box = $(`rbox-${socketId}`) || $(`rthumb-${socketId}`);
     if (box) {
@@ -792,13 +818,17 @@ async function startRoomSession(isRejoin = false) {
   showScreen('roomChat');
   buildRoomVideoLayout();
   reassignStreams();
+  updateRoomMemberCountDisplay();
   addRoomSysMessage(isRejoin ? 'Reconnected! Re-establishing video…' : 'Session started! Video connecting…');
-  if (!isRejoin) socket.emit('room_start', { roomId: currentRoomId });
 
-  // Connect to all existing peers
-  // Perfect Negotiation handles who sends the offer automatically
-  const peers = roomMembers.filter(m => m.socketId !== mySocketId);
-  await Promise.all(peers.map(m => connectToPeer(m.socketId)));
+  if (!isRejoin) {
+    // Tell server to start — server will broadcast room_session_started to everyone
+    socket.emit('room_start', { roomId: currentRoomId });
+  } else {
+    // On rejoin/late-join: connect to existing peers directly
+    const peers = roomMembers.filter(m => m.socketId !== mySocketId);
+    await Promise.all(peers.map(m => connectToPeer(m.socketId)));
+  }
 }
 
 // ─── Stranger chat helpers ────────────────────────────
