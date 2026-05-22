@@ -362,7 +362,11 @@ async function getOrCreateRoomPC(peerId) {
     if (!meta) return;
     try {
       meta.makingOffer = true;
-      await pc.setLocalDescription();   // browser auto-creates offer
+      // Explicit createOffer for full browser compatibility (Chrome, Firefox, Safari)
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      // If signaling state changed while we were waiting, abort
+      if (pc.signalingState !== 'stable') return;
+      await pc.setLocalDescription(offer);
       socket.emit('room_offer', { targetId: peerId, offer: pc.localDescription });
     } catch (e) {
       console.error(`[Room] negotiationneeded error for ${peerId}:`, e);
@@ -723,7 +727,8 @@ function initSocket() {
       }
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await flushIceQueue(fromId, pc);
-      await pc.setLocalDescription();   // auto-creates answer
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
       socket.emit('room_answer', { targetId: fromId, answer: pc.localDescription });
     } catch (e) { console.error(`[Room] Handle offer error from ${fromId}:`, e); }
   });
@@ -731,9 +736,9 @@ function initSocket() {
   socket.on('room_answer', async ({ fromId, answer }) => {
     const pc = roomPeers[fromId];
     if (!pc) return;
-    if (pc.signalingState === 'stable') {
-      // Already stable — this is a late/duplicate answer, safely ignore
-      console.log(`[Room] Ignoring late answer from ${fromId} (already stable)`);
+    // Only accept answer when we are waiting for one (have-local-offer)
+    if (pc.signalingState !== 'have-local-offer') {
+      console.log(`[Room] Ignoring answer from ${fromId} — state: ${pc.signalingState}`);
       return;
     }
     try {
