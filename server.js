@@ -136,7 +136,14 @@ io.on('connection', (socket) => {
   // ── Room: Start ──
   socket.on('room_start', ({ roomId }) => {
     const room = rooms.get(roomId);
-    if (room) { room.started = true; console.log(`[ROOM] ${roomId} session started`); }
+    if (!room) return;
+    room.started = true;
+    console.log(`[ROOM] ${roomId} session started by ${socket.id}`);
+    // Broadcast to ALL members (including host) so every client starts WebRTC
+    io.to(roomId).emit('room_session_started', {
+      members: room.members,
+      startedBy: socket.id
+    });
   });
 
   // ── Room: Join ──
