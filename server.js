@@ -8,20 +8,17 @@ const server = http.createServer(app);
 
 // ─── Socket.IO — optimized config ────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
-
-  pingTimeout:  20000,
-  pingInterval:  8000,
-
-  transports: ['websocket', 'polling'],
-
-  httpCompression: true,
-  perMessageDeflate: {
-    threshold: 256,
-    zlibDeflateOptions: { level: 1 },
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
   },
 
-  maxHttpBufferSize: 64 * 1024,
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ['websocket', 'polling'],
+  maxHttpBufferSize: 1e7,
+  connectTimeout: 45000,
+  allowEIO3: true
 });
 
 // ─── Static files with caching headers ───────────────────────────────────────
@@ -233,6 +230,7 @@ io.on('connection', (socket) => {
   socket.on('skip', () => handleDisconnectFromPair(socket, true));
 
   socket.on('disconnect', () => {
+    console.log('[DISCONNECT]', socket.id);
     onlineCount.value = Math.max(0, onlineCount.value - 1);
     broadcastOnlineCount();
     handleDisconnectFromPair(socket, false);
