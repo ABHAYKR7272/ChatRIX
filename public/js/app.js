@@ -7,23 +7,39 @@
 
 const ICE_SERVERS = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
+        'stun:global.stun.twilio.com:3478'
+      ]
+    },
+
     {
       urls: 'turn:openrelay.metered.ca:80',
       username: 'openrelayproject',
       credential: 'openrelayproject'
     },
+
     {
       urls: 'turn:openrelay.metered.ca:443',
       username: 'openrelayproject',
       credential: 'openrelayproject'
+    },
+
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
     }
   ],
-  iceCandidatePoolSize: 4,
+
+  iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle',
   rtcpMuxPolicy: 'require',
+  iceTransportPolicy: 'all'
 };
 
 // ─── State ───────────────────────────────────────────
@@ -47,6 +63,10 @@ let roomMuted       = false;
 let roomCamOff      = false;
 let remoteAudioMuted = {};
 let remoteVideoOff   = {};
+
+let reconnectTimers = {};
+let reconnectAttempts = {};
+const MAX_RECONNECT_ATTEMPTS = 15;
 
 /*
  * ── Perfect Negotiation per-peer state ──────────────────
