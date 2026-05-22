@@ -1,7 +1,8 @@
 /* ═══════════════════════════════════════════════════════
    CHAT-RIX — MAIN APP JS  (Stranger + Room Mode)
    OPTIMIZED: fast socket, parallel WebRTC, adaptive video,
-              lean particles, debounced layout rebuilds
+              lean particles, debounced layout rebuilds,
+              ICE queue, rejoin fix, fast reconnect
    ═══════════════════════════════════════════════════════ */
 'use strict';
 
@@ -21,10 +22,9 @@ const ICE_SERVERS = {
       credential: 'openrelayproject'
     }
   ],
-  // Trickle ICE: don't wait for all candidates — send as they arrive
   iceCandidatePoolSize: 4,
-  bundlePolicy: 'max-bundle',      // bundle audio+video on ONE transport (faster)
-  rtcpMuxPolicy: 'require',        // saves a port
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
 };
 
 // ─── State ───────────────────────────────────────────
@@ -48,6 +48,9 @@ let roomMuted        = false;
 let roomCamOff       = false;
 let remoteAudioMuted = {};
 let remoteVideoOff   = {};
+
+// FIX: ICE candidate queue per peer — store candidates before remoteDescription is set
+const iceQueues = {};
 
 // Layout rebuild debounce handle
 let rebuildTimer = null;
@@ -133,8 +136,6 @@ function showToast(msg, duration = 2800) {
 }
 
 // ─── Particles (optimised) ───────────────────────────
-// CHANGE: 90→40 particles, O(n²) connections replaced with spatial grid,
-//         animation paused when tab hidden to save CPU for background users
 (function initParticles() {
   const canvas = $('particleCanvas');
   if (!canvas) return;
@@ -143,8 +144,8 @@ function showToast(msg, duration = 2800) {
   let animRunning = true;
   let rafId = null;
   const COLORS = ['#00ffff', '#ff00aa', '#00ff88', '#ffffff'];
-  const COUNT  = 40;          // was 90
-  const LINK_D = 80;          // was 100 — fewer line checks
+  const COUNT  = 40;
+  const LINK_D = 80;
 
   function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
 
@@ -162,10 +163,7 @@ function showToast(msg, duration = 2800) {
   function draw() {
     if (!animRunning) { rafId = null; return; }
     rafId = requestAnimationFrame(draw);
-
     ctx.clearRect(0, 0, W, H);
-
-    // Draw dots
     for (let i = 0; i < COUNT; i++) {
       const p = particles[i];
       ctx.beginPath();
@@ -178,8 +176,6 @@ function showToast(msg, duration = 2800) {
       if (p.y < 0) p.y = H; if (p.y > H) p.y = 0;
     }
     ctx.globalAlpha = 1;
-
-    // Draw connections — O(n²) but n=40 so ~780 checks (was 4005 with n=90)
     ctx.lineWidth = .5;
     for (let i = 0; i < COUNT; i++) {
       for (let j = i + 1; j < COUNT; j++) {
@@ -198,7 +194,6 @@ function showToast(msg, duration = 2800) {
     }
   }
 
-  // Pause animation when tab is hidden — saves CPU for background users
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       animRunning = false;
@@ -215,9 +210,7 @@ function showToast(msg, duration = 2800) {
 })();
 
 // ─── Media ───────────────────────────────────────────
-// CHANGE: adaptive constraints — lower resolution when multiple peers (saves bandwidth)
 function getVideoConstraints(peerCount = 0) {
-  // 1:1 → 720p ideal, many peers → 480p to save upload bandwidth
   const isMulti = peerCount > 1;
   return {
     width:       { ideal: isMulti ? 640  : 1280 },
@@ -228,6 +221,11 @@ function getVideoConstraints(peerCount = 0) {
 }
 
 async function getLocalMedia() {
+  // FIX: stop any existing stale stream before getting a new one
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
   const peerCount = Object.keys(roomPeers).length;
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
@@ -255,9 +253,31 @@ function stopLocalMedia() {
   localVideo.srcObject = null;
 }
 
+// ─── ICE Queue helpers ────────────────────────────────
+// FIX: Buffer ICE candidates that arrive before remoteDescription is set
+function getIceQueue(peerId) {
+  if (!iceQueues[peerId]) iceQueues[peerId] = [];
+  return iceQueues[peerId];
+}
+
+async function flushIceQueue(peerId, pc) {
+  const q = iceQueues[peerId];
+  if (!q || !q.length) return;
+  const candidates = q.splice(0);
+  for (const c of candidates) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
+    catch (e) { console.warn('[ICE flush] error:', e); }
+  }
+}
+
+function clearIceQueue(peerId) {
+  delete iceQueues[peerId];
+}
+
 // ─── WebRTC: Stranger ────────────────────────────────
 function createPeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
+  clearIceQueue('stranger');
   peerConnection = new RTCPeerConnection(ICE_SERVERS);
   if (localStream) localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
   peerConnection.ontrack = e => {
@@ -290,6 +310,7 @@ async function startCall(initiator) {
 
 function closePeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
+  clearIceQueue('stranger');
   remoteVideo.srcObject = null;
   remoteStatus.textContent = 'Connecting...';
   remoteStatus.classList.remove('hidden');
@@ -299,6 +320,8 @@ function closePeerConnection() {
 // ─── WebRTC: Room (mesh) ──────────────────────────────
 async function createRoomPeerConnection(peerId) {
   if (roomPeers[peerId]) { roomPeers[peerId].close(); delete roomPeers[peerId]; }
+  clearIceQueue(peerId);
+
   const pc = new RTCPeerConnection(ICE_SERVERS);
   roomPeers[peerId] = pc;
 
@@ -320,6 +343,13 @@ async function createRoomPeerConnection(peerId) {
     const s = pc.connectionState;
     const indicator = document.getElementById(`ri-${peerId}`);
     if (indicator) indicator.style.background = (s === 'connected') ? '#00ff88' : '#ff2244';
+    // FIX: if connection fails, retry after 2s
+    if (s === 'failed') {
+      console.warn(`[Room WebRTC] Connection failed for ${peerId}, will retry`);
+      setTimeout(() => {
+        if (roomPeers[peerId]) initiateRoomOffer(peerId).catch(console.error);
+      }, 2000);
+    }
   };
 
   return pc;
@@ -335,7 +365,7 @@ async function initiateRoomOffer(peerId) {
 }
 
 function closeAllRoomPeers() {
-  Object.values(roomPeers).forEach(pc => pc.close());
+  Object.keys(roomPeers).forEach(id => { roomPeers[id].close(); clearIceQueue(id); });
   roomPeers  = {};
   roomStreams = {};
 }
@@ -395,8 +425,6 @@ function buildRoomVideoLayout() {
   }
 }
 
-// CHANGE: debounce layout rebuild — prevents rapid DOM thrashing when many
-//         users join/leave quickly (e.g. multiple joins within 150 ms)
 function scheduleBuildRoomVideoLayout() {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => {
@@ -576,7 +604,6 @@ function addRoomMessage(text, type, from) {
   const body = document.createElement('div'); body.textContent = text; wrap.appendChild(body);
   roomMessagesContainer.appendChild(wrap);
   roomMessagesContainer.scrollTop = roomMessagesContainer.scrollHeight;
-  // Lightweight CSS animation instead of JS-driven rAF transitions
   wrap.style.cssText = `opacity:0;transform:translateX(${type==='sent'?'10px':'-10px'})`;
   requestAnimationFrame(() => {
     wrap.style.transition = 'opacity .15s,transform .15s';
@@ -596,8 +623,6 @@ function sendRoomMessage() {
 function updateLobbyUI(members) {
   roomMembers = members;
   lobbyMemberCount.textContent = members.length;
-
-  // CHANGE: use DocumentFragment — single DOM insert instead of N inserts
   const frag = document.createDocumentFragment();
   members.forEach(m => {
     const pill = document.createElement('div');
@@ -613,18 +638,17 @@ function updateLobbyUI(members) {
 function initSocket() {
   if (socket && socket.connected) return;
 
-  // CHANGE: websocket-first — skip polling handshake, connect instantly
   socket = io({
-    transports: ['websocket'],          // try WS first; auto-falls back if blocked
+    transports: ['websocket'],
     upgrade: true,
-    reconnectionAttempts: 5,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 4000,
-    timeout: 10000,                     // fail fast (was default 20s)
+    reconnectionAttempts: 10,          // FIX: more attempts on rejoin
+    reconnectionDelay: 500,            // FIX: faster first retry (was 1000)
+    reconnectionDelayMax: 3000,        // FIX: cap at 3s (was 4s)
+    timeout: 8000,                     // FIX: fail faster (was 10s)
   });
 
   socket.on('connect', () => {
-    mySocketId = socket.id;
+    mySocketId = socket.id;            // FIX: set immediately on connect
     console.log('[SOCKET] Connected:', socket.id);
     if (socket._pendingAction) { socket._pendingAction(); socket._pendingAction = null; }
   });
@@ -650,6 +674,8 @@ function initSocket() {
     if (!peerConnection) createPeerConnection();
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+      // FIX: flush queued ICE candidates after remote description is set
+      await flushIceQueue('stranger', peerConnection);
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
       socket.emit('webrtc_answer', { answer });
@@ -658,12 +684,21 @@ function initSocket() {
 
   socket.on('webrtc_answer', async ({ answer }) => {
     if (!peerConnection) return;
-    try { await peerConnection.setRemoteDescription(new RTCSessionDescription(answer)); }
+    try {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      // FIX: flush queued ICE candidates after remote description is set
+      await flushIceQueue('stranger', peerConnection);
+    }
     catch (e) { console.error('[WebRTC] Set answer error:', e); }
   });
 
   socket.on('webrtc_ice', async ({ candidate }) => {
     if (!peerConnection) return;
+    // FIX: queue if remote description not yet set
+    if (!peerConnection.remoteDescription) {
+      getIceQueue('stranger').push(candidate);
+      return;
+    }
     try { await peerConnection.addIceCandidate(new RTCIceCandidate(candidate)); }
     catch (e) { console.warn('[WebRTC] ICE error:', e); }
   });
@@ -682,11 +717,13 @@ function initSocket() {
 
   socket.on('room_joined', ({ roomId, name, members, started }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
-    mySocketId = socket.id;
+    mySocketId = socket.id;  // FIX: ensure mySocketId is fresh on every join/rejoin
     lobbyRoomId.textContent = roomId;
     if (started) {
       showToast(`✓ Rejoined room ${roomId} — reconnecting…`);
-      startRoomSession();
+      // FIX: close stale peers before starting fresh session on rejoin
+      closeAllRoomPeers();
+      startRoomSession(true);   // pass isRejoin=true to skip room_start emit
     } else {
       updateLobbyUI(members);
       showScreen('roomLobby');
@@ -704,7 +741,6 @@ function initSocket() {
     updateRoomMemberCountDisplay();
 
     if (sessionActive && screens.roomChat.classList.contains('active')) {
-      // CHANGE: schedule debounced rebuild instead of immediate
       scheduleBuildRoomVideoLayout();
       initiateRoomOffer(socketId);
     }
@@ -717,13 +753,13 @@ function initSocket() {
     showToast(`🔴 ${name} left`);
 
     if (roomPeers[socketId]) { roomPeers[socketId].close(); delete roomPeers[socketId]; }
+    clearIceQueue(socketId);
     delete roomStreams[socketId];
     delete silenceState[socketId];
 
     const box = $(`rbox-${socketId}`) || $(`rthumb-${socketId}`);
     if (box) box.remove();
 
-    // CHANGE: debounced rebuild instead of setTimeout 100ms
     scheduleBuildRoomVideoLayout();
   });
 
@@ -731,6 +767,8 @@ function initSocket() {
     const pc = await createRoomPeerConnection(fromId);
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      // FIX: flush queued ICE candidates after remote description is set
+      await flushIceQueue(fromId, pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('room_answer', { targetId: fromId, answer });
@@ -740,13 +778,21 @@ function initSocket() {
   socket.on('room_answer', async ({ fromId, answer }) => {
     const pc = roomPeers[fromId];
     if (!pc) return;
-    try { await pc.setRemoteDescription(new RTCSessionDescription(answer)); }
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      // FIX: flush queued ICE candidates after remote description is set
+      await flushIceQueue(fromId, pc);
+    }
     catch (e) { console.error('[Room] Set answer error:', e); }
   });
 
   socket.on('room_ice', async ({ fromId, candidate }) => {
     const pc = roomPeers[fromId];
-    if (!pc) return;
+    if (!pc || !pc.remoteDescription) {
+      // FIX: queue candidates that arrive before remoteDescription is set
+      getIceQueue(fromId).push(candidate);
+      return;
+    }
     try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
     catch (e) { console.warn('[Room] ICE error:', e); }
   });
@@ -783,22 +829,34 @@ function updateRoomMemberCountDisplay() {
 }
 
 // ─── Start Room Session ───────────────────────────────
-// CHANGE: parallel WebRTC offers with Promise.all — was sequential await loop
-async function startRoomSession() {
+// FIX: isRejoin param — skip room_start emit on rejoin (server already knows)
+async function startRoomSession(isRejoin = false) {
+  // FIX: ensure fresh media stream before connecting
+  await getLocalMedia();
+
   roomIdDisplay.textContent = currentRoomId;
   showScreen('roomChat');
   buildRoomVideoLayout();
   reassignStreams();
-  addRoomSysMessage('Session started! Video connecting…');
 
-  socket.emit('room_start', { roomId: currentRoomId });
+  if (isRejoin) {
+    addRoomSysMessage('Reconnected! Re-establishing video…');
+  } else {
+    addRoomSysMessage('Session started! Video connecting…');
+    socket.emit('room_start', { roomId: currentRoomId });
+  }
 
   const myIndex = roomMembers.findIndex(m => m.socketId === mySocketId);
-  const targets = roomMembers.slice(0, myIndex);   // peers before me in list
+  const targets = roomMembers.slice(0, myIndex);
 
   if (targets.length > 0) {
-    // Fire all offers simultaneously — no waiting for one before starting next
     await Promise.all(targets.map(peer => initiateRoomOffer(peer.socketId)));
+  }
+
+  // FIX: on rejoin, also offer to ALL other members (not just those before us)
+  if (isRejoin) {
+    const allOthers = roomMembers.filter(m => m.socketId !== mySocketId);
+    await Promise.all(allOthers.map(peer => initiateRoomOffer(peer.socketId)));
   }
 }
 
@@ -962,7 +1020,7 @@ joinRoomIdInput.addEventListener('input', e => {
   e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
 });
 
-btnStartRoom.addEventListener('click', startRoomSession);
+btnStartRoom.addEventListener('click', () => startRoomSession(false));
 $('btn-cancel-room').addEventListener('click', leaveRoom);
 $('btn-copy-room-id').addEventListener('click', () => {
   navigator.clipboard.writeText(lobbyRoomId.textContent)
