@@ -1,8 +1,7 @@
 /* ═══════════════════════════════════════════════════════
    CHAT-RIX — MAIN APP JS  (Stranger + Room Mode)
-   OPTIMIZED: fast socket, parallel WebRTC, adaptive video,
-              lean particles, debounced layout rebuilds,
-              ICE queue, rejoin fix, fast reconnect
+   v3 — Perfect Negotiation pattern, ICE queue,
+        rejoin fix, stale-peer cleanup, fast reconnect
    ═══════════════════════════════════════════════════════ */
 'use strict';
 
@@ -28,31 +27,43 @@ const ICE_SERVERS = {
 };
 
 // ─── State ───────────────────────────────────────────
-let socket           = null;
-let localStream      = null;
-let peerConnection   = null;
-let myName           = '';
-let isMuted          = false;
-let isCamOff         = false;
+let socket            = null;
+let localStream       = null;
+let peerConnection    = null;   // stranger 1:1
+let myName            = '';
+let isMuted           = false;
+let isCamOff          = false;
 let isConnectedToPeer = false;
 
 // Room
-let currentRoomId    = null;
-let roomPeers        = {};
-let roomStreams       = {};
-let silenceState     = {};
-let roomMembers      = [];
-let mySocketId       = null;
-let focusedPeerId    = null;
-let roomMuted        = false;
-let roomCamOff       = false;
+let currentRoomId   = null;
+let roomPeers       = {};   // peerId → RTCPeerConnection
+let roomStreams      = {};   // peerId → MediaStream
+let silenceState    = {};
+let roomMembers     = [];
+let mySocketId      = null;
+let focusedPeerId   = null;
+let roomMuted       = false;
+let roomCamOff      = false;
 let remoteAudioMuted = {};
 let remoteVideoOff   = {};
 
-// FIX: ICE candidate queue per peer — store candidates before remoteDescription is set
-const iceQueues = {};
+/*
+ * ── Perfect Negotiation per-peer state ──────────────────
+ * peerMeta[peerId] = {
+ *   makingOffer   : bool   — currently in createOffer()
+ *   ignoreOffer   : bool   — should ignore incoming offer (collision)
+ *   isPolite      : bool   — polite peer rolls back & accepts; impolite ignores
+ * }
+ * Rule: lower socketId string → impolite (keeps its offer)
+ *       higher socketId string → polite (rolls back on collision)
+ */
+const peerMeta = {};
 
-// Layout rebuild debounce handle
+// ICE candidate queue — buffer candidates that arrive before remoteDescription
+const iceQueues = {};   // peerId → RTCIceCandidateInit[]
+
+// Layout rebuild debounce
 let rebuildTimer = null;
 
 // ─── DOM ─────────────────────────────────────────────
@@ -66,7 +77,6 @@ const screens = {
   chat:         document.getElementById('screen-chat'),
   roomChat:     document.getElementById('screen-room-chat'),
 };
-
 const $ = id => document.getElementById(id);
 
 const toastEl        = $('toast');
@@ -93,27 +103,27 @@ const remoteStatus       = $('remote-status');
 const partnerNameDisplay = $('partner-name-display');
 const modalLeft          = $('modal-left');
 
-// Create/Join
-const createNameInput  = $('create-name-input');
-const createPassInput  = $('create-pass-input');
-const joinNameInput    = $('join-name-input');
-const joinRoomIdInput  = $('join-roomid-input');
-const joinPassInput    = $('join-pass-input');
+// Create / Join
+const createNameInput = $('create-name-input');
+const createPassInput = $('create-pass-input');
+const joinNameInput   = $('join-name-input');
+const joinRoomIdInput = $('join-roomid-input');
+const joinPassInput   = $('join-pass-input');
 
 // Room
-const lobbyRoomId              = $('lobby-room-id');
-const lobbyMembersList         = $('lobby-members-list');
-const lobbyMemberCount         = $('lobby-member-count');
-const btnStartRoom             = $('btn-start-room');
-const roomVideoPanel           = $('room-video-panel');
-const roomMessagesContainer    = $('room-messages-container');
-const roomChatInput            = $('room-chat-input');
-const btnRoomSend              = $('btn-room-send');
-const roomIdDisplay            = $('room-id-display');
-const roomMemberCountDisplay   = $('room-member-count-display');
-const btnRoomMute              = $('btn-room-mute');
-const btnRoomCam               = $('btn-room-cam');
-const btnRoomLeave             = $('btn-room-leave');
+const lobbyRoomId            = $('lobby-room-id');
+const lobbyMembersList       = $('lobby-members-list');
+const lobbyMemberCount       = $('lobby-member-count');
+const btnStartRoom           = $('btn-start-room');
+const roomVideoPanel         = $('room-video-panel');
+const roomMessagesContainer  = $('room-messages-container');
+const roomChatInput          = $('room-chat-input');
+const btnRoomSend            = $('btn-room-send');
+const roomIdDisplay          = $('room-id-display');
+const roomMemberCountDisplay = $('room-member-count-display');
+const btnRoomMute            = $('btn-room-mute');
+const btnRoomCam             = $('btn-room-cam');
+const btnRoomLeave           = $('btn-room-leave');
 
 // ─── Screen Manager ──────────────────────────────────
 function showScreen(name) {
@@ -135,7 +145,7 @@ function showToast(msg, duration = 2800) {
   toastTimer = setTimeout(() => toastEl.classList.remove('show'), duration);
 }
 
-// ─── Particles (optimised) ───────────────────────────
+// ─── Particles ───────────────────────────────────────
 (function initParticles() {
   const canvas = $('particleCanvas');
   if (!canvas) return;
@@ -144,65 +154,49 @@ function showToast(msg, duration = 2800) {
   let animRunning = true;
   let rafId = null;
   const COLORS = ['#00ffff', '#ff00aa', '#00ff88', '#ffffff'];
-  const COUNT  = 40;
-  const LINK_D = 80;
+  const COUNT = 40, LINK_D = 80;
 
   function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
-
   function rp() {
     return {
       x: Math.random() * W, y: Math.random() * H,
       r: Math.random() * 1.2 + 0.3,
-      dx: (Math.random() - .5) * .35,
-      dy: (Math.random() - .5) * .35,
+      dx: (Math.random() - .5) * .35, dy: (Math.random() - .5) * .35,
       color: COLORS[Math.floor(Math.random() * COLORS.length)],
       alpha: Math.random() * .4 + .1
     };
   }
-
   function draw() {
     if (!animRunning) { rafId = null; return; }
     rafId = requestAnimationFrame(draw);
     ctx.clearRect(0, 0, W, H);
     for (let i = 0; i < COUNT; i++) {
       const p = particles[i];
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-      ctx.fillStyle = p.color;
-      ctx.globalAlpha = p.alpha;
-      ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fillStyle = p.color; ctx.globalAlpha = p.alpha; ctx.fill();
       p.x += p.dx; p.y += p.dy;
       if (p.x < 0) p.x = W; if (p.x > W) p.x = 0;
       if (p.y < 0) p.y = H; if (p.y > H) p.y = 0;
     }
-    ctx.globalAlpha = 1;
-    ctx.lineWidth = .5;
+    ctx.globalAlpha = 1; ctx.lineWidth = .5;
     for (let i = 0; i < COUNT; i++) {
       for (let j = i + 1; j < COUNT; j++) {
-        const dx = particles[i].x - particles[j].x;
-        const dy = particles[i].y - particles[j].y;
+        const dx = particles[i].x - particles[j].x, dy = particles[i].y - particles[j].y;
         const d2 = dx * dx + dy * dy;
         if (d2 < LINK_D * LINK_D) {
-          const alpha = .06 * (1 - Math.sqrt(d2) / LINK_D);
           ctx.beginPath();
           ctx.moveTo(particles[i].x, particles[i].y);
           ctx.lineTo(particles[j].x, particles[j].y);
-          ctx.strokeStyle = `rgba(0,255,255,${alpha})`;
+          ctx.strokeStyle = `rgba(0,255,255,${.06 * (1 - Math.sqrt(d2) / LINK_D)})`;
           ctx.stroke();
         }
       }
     }
   }
-
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      animRunning = false;
-    } else {
-      animRunning = true;
-      if (!rafId) draw();
-    }
+    animRunning = !document.hidden;
+    if (animRunning && !rafId) draw();
   });
-
   window.addEventListener('resize', resize);
   resize();
   particles = Array.from({ length: COUNT }, rp);
@@ -213,19 +207,16 @@ function showToast(msg, duration = 2800) {
 function getVideoConstraints(peerCount = 0) {
   const isMulti = peerCount > 1;
   return {
-    width:       { ideal: isMulti ? 640  : 1280 },
-    height:      { ideal: isMulti ? 480  : 720  },
-    frameRate:   { ideal: isMulti ? 20   : 30   },
+    width:     { ideal: isMulti ? 640  : 1280 },
+    height:    { ideal: isMulti ? 480  : 720  },
+    frameRate: { ideal: isMulti ? 20   : 30   },
     facingMode: 'user'
   };
 }
 
 async function getLocalMedia() {
-  // FIX: stop any existing stale stream before getting a new one
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
+  // Stop any stale stream first
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   const peerCount = Object.keys(roomPeers).length;
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
@@ -234,13 +225,13 @@ async function getLocalMedia() {
     });
     localVideo.srcObject = localStream;
     return true;
-  } catch (err) {
+  } catch {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localVideo.srcObject = null;
       showToast('⚠ Camera unavailable — audio only');
       return true;
-    } catch (e) {
+    } catch {
       showToast('⚠ No media access — text only');
       localStream = null;
       return true;
@@ -254,40 +245,37 @@ function stopLocalMedia() {
 }
 
 // ─── ICE Queue helpers ────────────────────────────────
-// FIX: Buffer ICE candidates that arrive before remoteDescription is set
-function getIceQueue(peerId) {
+function enqueueIce(peerId, candidate) {
   if (!iceQueues[peerId]) iceQueues[peerId] = [];
-  return iceQueues[peerId];
+  iceQueues[peerId].push(candidate);
 }
 
 async function flushIceQueue(peerId, pc) {
   const q = iceQueues[peerId];
   if (!q || !q.length) return;
-  const candidates = q.splice(0);
-  for (const c of candidates) {
+  const batch = q.splice(0);
+  for (const c of batch) {
     try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
-    catch (e) { console.warn('[ICE flush] error:', e); }
+    catch (e) { console.warn(`[ICE flush ${peerId}]`, e.message); }
   }
 }
 
-function clearIceQueue(peerId) {
-  delete iceQueues[peerId];
-}
+function clearIceQueue(peerId) { delete iceQueues[peerId]; }
 
-// ─── WebRTC: Stranger ────────────────────────────────
+// ─── WebRTC: Stranger 1:1 ────────────────────────────
 function createPeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
-  clearIceQueue('stranger');
+  clearIceQueue('_stranger');
   peerConnection = new RTCPeerConnection(ICE_SERVERS);
   if (localStream) localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
   peerConnection.ontrack = e => {
-    if (e.streams && e.streams[0]) { remoteVideo.srcObject = e.streams[0]; remoteStatus.classList.add('hidden'); }
+    if (e.streams?.[0]) { remoteVideo.srcObject = e.streams[0]; remoteStatus.classList.add('hidden'); }
   };
   peerConnection.onicecandidate = e => {
     if (e.candidate) socket.emit('webrtc_ice', { candidate: e.candidate });
   };
   peerConnection.onconnectionstatechange = () => {
-    const s = peerConnection.connectionState;
+    const s = peerConnection?.connectionState;
     if (s === 'connected') { remoteStatus.classList.add('hidden'); isConnectedToPeer = true; }
     else if (s === 'failed' || s === 'disconnected') {
       remoteStatus.textContent = 'Connection lost...';
@@ -310,64 +298,99 @@ async function startCall(initiator) {
 
 function closePeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
-  clearIceQueue('stranger');
+  clearIceQueue('_stranger');
   remoteVideo.srcObject = null;
   remoteStatus.textContent = 'Connecting...';
   remoteStatus.classList.remove('hidden');
   isConnectedToPeer = false;
 }
 
-// ─── WebRTC: Room (mesh) ──────────────────────────────
-async function createRoomPeerConnection(peerId) {
-  if (roomPeers[peerId]) { roomPeers[peerId].close(); delete roomPeers[peerId]; }
+// ══════════════════════════════════════════════════════
+//  ROOM WebRTC — Perfect Negotiation
+//  https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
+//
+//  Polite peer  (higher socketId) → rolls back its own offer on collision
+//  Impolite peer (lower socketId) → ignores incoming offer on collision
+//  This completely eliminates "Called in wrong state: stable" errors
+// ══════════════════════════════════════════════════════
+
+function isPolite(peerId) {
+  // polite = our socketId is lexicographically greater
+  return mySocketId > peerId;
+}
+
+async function getOrCreateRoomPC(peerId) {
+  if (roomPeers[peerId]) return roomPeers[peerId];
+
   clearIceQueue(peerId);
+  peerMeta[peerId] = { makingOffer: false, ignoreOffer: false };
 
   const pc = new RTCPeerConnection(ICE_SERVERS);
   roomPeers[peerId] = pc;
 
+  // Add local tracks
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
+  // Remote track received
   pc.ontrack = e => {
-    if (e.streams && e.streams[0]) {
+    if (e.streams?.[0]) {
       roomStreams[peerId] = e.streams[0];
-      const videoEl = document.getElementById(`rv-${peerId}`);
-      if (videoEl) videoEl.srcObject = e.streams[0];
+      const vid = document.getElementById(`rv-${peerId}`);
+      if (vid) vid.srcObject = e.streams[0];
     }
   };
 
+  // Trickle ICE
   pc.onicecandidate = e => {
     if (e.candidate) socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
   };
 
+  // Connection state indicator
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
-    const indicator = document.getElementById(`ri-${peerId}`);
-    if (indicator) indicator.style.background = (s === 'connected') ? '#00ff88' : '#ff2244';
-    // FIX: if connection fails, retry after 2s
+    const ind = document.getElementById(`ri-${peerId}`);
+    if (ind) ind.style.background = s === 'connected' ? '#00ff88' : (s === 'failed' ? '#ff2244' : '#ffaa00');
     if (s === 'failed') {
-      console.warn(`[Room WebRTC] Connection failed for ${peerId}, will retry`);
-      setTimeout(() => {
-        if (roomPeers[peerId]) initiateRoomOffer(peerId).catch(console.error);
-      }, 2000);
+      console.warn(`[Room] PC failed for ${peerId} — restarting ICE`);
+      pc.restartIce();   // triggers onnegotiationneeded → new offer automatically
+    }
+  };
+
+  // ── Perfect Negotiation: onnegotiationneeded ──────────
+  pc.onnegotiationneeded = async () => {
+    const meta = peerMeta[peerId];
+    if (!meta) return;
+    try {
+      meta.makingOffer = true;
+      await pc.setLocalDescription();   // browser auto-creates offer
+      socket.emit('room_offer', { targetId: peerId, offer: pc.localDescription });
+    } catch (e) {
+      console.error(`[Room] negotiationneeded error for ${peerId}:`, e);
+    } finally {
+      if (meta) meta.makingOffer = false;
     }
   };
 
   return pc;
 }
 
-async function initiateRoomOffer(peerId) {
-  const pc = await createRoomPeerConnection(peerId);
-  try {
-    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-    await pc.setLocalDescription(offer);
-    socket.emit('room_offer', { targetId: peerId, offer });
-  } catch (e) { console.error('[Room WebRTC] Offer error:', e); }
+// Called when we want to connect to a new peer
+async function connectToPeer(peerId) {
+  await getOrCreateRoomPC(peerId);
+  // onnegotiationneeded fires automatically after addTrack — no manual createOffer needed
+}
+
+function closeRoomPC(peerId) {
+  const pc = roomPeers[peerId];
+  if (pc) { pc.onnegotiationneeded = null; pc.onicecandidate = null; pc.ontrack = null; pc.close(); }
+  delete roomPeers[peerId];
+  delete roomStreams[peerId];
+  delete peerMeta[peerId];
+  clearIceQueue(peerId);
 }
 
 function closeAllRoomPeers() {
-  Object.keys(roomPeers).forEach(id => { roomPeers[id].close(); clearIceQueue(id); });
-  roomPeers  = {};
-  roomStreams = {};
+  Object.keys(roomPeers).forEach(id => closeRoomPC(id));
 }
 
 function reassignStreams() {
@@ -382,43 +405,28 @@ function buildRoomVideoLayout() {
   const panel = roomVideoPanel;
   panel.innerHTML = '';
   panel.className = 'video-panel room-video-panel';
-
   const others = roomMembers.filter(m => m.socketId !== mySocketId);
   const total  = roomMembers.length;
 
   if (total <= 2) {
     panel.classList.add('layout-split');
     panel.appendChild(makeMyVideoBox());
-    others.forEach(m => panel.appendChild(makeRemoteVideoBox(m, false)));
+    others.forEach(m => panel.appendChild(makeRemoteVideoBox(m)));
   } else {
     panel.classList.add('layout-multi');
-
     const bigWrap = document.createElement('div');
-    bigWrap.className = 'room-big-wrap';
-    bigWrap.id = 'room-big-wrap';
-
-    const bigMyVideo = document.createElement('video');
-    bigMyVideo.id = 'room-big-video';
-    bigMyVideo.autoplay = true;
-    bigMyVideo.playsInline = true;
-    bigMyVideo.muted = true;
-    if (localStream) bigMyVideo.srcObject = localStream;
-    bigWrap.appendChild(bigMyVideo);
-
-    const bigLabel = document.createElement('div');
-    bigLabel.id = 'room-big-label';
-    bigLabel.className = 'video-label local-label';
-    bigLabel.textContent = 'YOU';
-    bigWrap.appendChild(bigLabel);
-
-    ['tl', 'tr', 'bl', 'br'].forEach(c => {
-      const d = document.createElement('div'); d.className = `video-corner ${c}`; bigWrap.appendChild(d);
-    });
+    bigWrap.className = 'room-big-wrap'; bigWrap.id = 'room-big-wrap';
+    const bigVid = document.createElement('video');
+    bigVid.id = 'room-big-video'; bigVid.autoplay = true; bigVid.playsInline = true; bigVid.muted = true;
+    if (localStream) bigVid.srcObject = localStream;
+    bigWrap.appendChild(bigVid);
+    const bigLbl = document.createElement('div');
+    bigLbl.id = 'room-big-label'; bigLbl.className = 'video-label local-label'; bigLbl.textContent = 'YOU';
+    bigWrap.appendChild(bigLbl);
+    ['tl','tr','bl','br'].forEach(c => { const d = document.createElement('div'); d.className=`video-corner ${c}`; bigWrap.appendChild(d); });
     panel.appendChild(bigWrap);
-
     const strip = document.createElement('div');
-    strip.className = 'room-strip';
-    strip.id = 'room-strip';
+    strip.className = 'room-strip'; strip.id = 'room-strip';
     strip.appendChild(makeMyThumb());
     others.forEach(m => strip.appendChild(makeRemoteThumb(m)));
     panel.appendChild(strip);
@@ -427,144 +435,92 @@ function buildRoomVideoLayout() {
 
 function scheduleBuildRoomVideoLayout() {
   clearTimeout(rebuildTimer);
-  rebuildTimer = setTimeout(() => {
-    buildRoomVideoLayout();
-    reassignStreams();
-  }, 150);
+  rebuildTimer = setTimeout(() => { buildRoomVideoLayout(); reassignStreams(); }, 150);
 }
 
 function makeMyVideoBox() {
-  const box = document.createElement('div');
-  box.className = 'video-box local-box';
-  const vid = document.createElement('video');
-  vid.autoplay = true; vid.playsInline = true; vid.muted = true;
+  const box = document.createElement('div'); box.className = 'video-box local-box';
+  const vid = document.createElement('video'); vid.autoplay=true; vid.playsInline=true; vid.muted=true;
   if (localStream) vid.srcObject = localStream;
   box.appendChild(vid);
-  const lbl = document.createElement('div');
-  lbl.className = 'video-label local-label';
-  lbl.textContent = 'YOU';
+  const lbl = document.createElement('div'); lbl.className='video-label local-label'; lbl.textContent='YOU';
   box.appendChild(lbl);
-  ['tl', 'tr', 'bl', 'br'].forEach(c => {
-    const d = document.createElement('div'); d.className = `video-corner ${c}`; box.appendChild(d);
-  });
+  ['tl','tr','bl','br'].forEach(c=>{ const d=document.createElement('div'); d.className=`video-corner ${c}`; box.appendChild(d); });
   return box;
 }
 
-function makeRemoteVideoBox(member, isThumb) {
-  const box = document.createElement('div');
-  box.className = isThumb ? 'video-box remote-box room-thumb' : 'video-box remote-box';
-  box.id = `rbox-${member.socketId}`;
-
-  const vid = document.createElement('video');
-  vid.id = `rv-${member.socketId}`;
-  vid.autoplay = true; vid.playsInline = true;
+function makeRemoteVideoBox(member) {
+  const box = document.createElement('div'); box.className='video-box remote-box'; box.id=`rbox-${member.socketId}`;
+  const vid = document.createElement('video'); vid.id=`rv-${member.socketId}`; vid.autoplay=true; vid.playsInline=true;
   box.appendChild(vid);
-
-  const lbl = document.createElement('div');
-  lbl.className = 'video-label remote-label';
-  lbl.textContent = member.name.toUpperCase();
+  const lbl = document.createElement('div'); lbl.className='video-label remote-label'; lbl.textContent=member.name.toUpperCase();
   box.appendChild(lbl);
-
-  const ind = document.createElement('div');
-  ind.id = `ri-${member.socketId}`;
-  ind.className = 'conn-indicator';
+  const ind = document.createElement('div'); ind.id=`ri-${member.socketId}`; ind.className='conn-indicator';
   box.appendChild(ind);
-
-  ['tl', 'tr', 'bl', 'br'].forEach(c => {
-    const d = document.createElement('div'); d.className = `video-corner ${c}`; box.appendChild(d);
-  });
+  ['tl','tr','bl','br'].forEach(c=>{ const d=document.createElement('div'); d.className=`video-corner ${c}`; box.appendChild(d); });
   return box;
 }
 
 function makeMyThumb() {
-  const thumb = document.createElement('div');
-  thumb.className = 'room-thumb-item room-thumb-me';
-  thumb.title = 'You (click to focus)';
-  const vid = document.createElement('video');
-  vid.autoplay = true; vid.playsInline = true; vid.muted = true;
+  const thumb = document.createElement('div'); thumb.className='room-thumb-item room-thumb-me'; thumb.title='You (click to focus)';
+  const vid = document.createElement('video'); vid.autoplay=true; vid.playsInline=true; vid.muted=true;
   if (localStream) vid.srcObject = localStream;
   thumb.appendChild(vid);
-  const lbl = document.createElement('span'); lbl.textContent = 'YOU'; thumb.appendChild(lbl);
-  thumb.addEventListener('click', () => focusBigMe());
+  const lbl = document.createElement('span'); lbl.textContent='YOU'; thumb.appendChild(lbl);
+  thumb.addEventListener('click', focusBigMe);
   return thumb;
 }
 
 function makeRemoteThumb(member) {
-  const thumb = document.createElement('div');
-  thumb.className = 'room-thumb-item';
-  thumb.id = `rthumb-${member.socketId}`;
-  const vid = document.createElement('video');
-  vid.id = `rv-${member.socketId}`;
-  vid.autoplay = true; vid.playsInline = true;
+  const thumb = document.createElement('div'); thumb.className='room-thumb-item'; thumb.id=`rthumb-${member.socketId}`;
+  const vid = document.createElement('video'); vid.id=`rv-${member.socketId}`; vid.autoplay=true; vid.playsInline=true;
   thumb.appendChild(vid);
-  const lbl = document.createElement('span');
-  lbl.textContent = member.name.slice(0, 10).toUpperCase();
-  thumb.appendChild(lbl);
+  const lbl = document.createElement('span'); lbl.textContent=member.name.slice(0,10).toUpperCase(); thumb.appendChild(lbl);
 
-  const overlay = document.createElement('div');
-  overlay.className = 'thumb-overlay';
+  const overlay = document.createElement('div'); overlay.className='thumb-overlay';
 
-  const btnMuteAudio = document.createElement('button');
-  btnMuteAudio.className = 'thumb-ctrl-btn';
-  btnMuteAudio.title = 'Mute their audio for you';
-  btnMuteAudio.innerHTML = '🔊';
-  btnMuteAudio.addEventListener('click', e => {
-    e.stopPropagation(); toggleRemoteAudio(member.socketId, vid, btnMuteAudio);
-  });
-  overlay.appendChild(btnMuteAudio);
+  const btnAud = document.createElement('button'); btnAud.className='thumb-ctrl-btn'; btnAud.title='Mute audio locally'; btnAud.innerHTML='🔊';
+  btnAud.addEventListener('click', e => { e.stopPropagation(); toggleRemoteAudio(member.socketId, vid, btnAud); });
+  overlay.appendChild(btnAud);
 
-  const btnMuteVid = document.createElement('button');
-  btnMuteVid.className = 'thumb-ctrl-btn';
-  btnMuteVid.title = 'Hide their video for you';
-  btnMuteVid.innerHTML = '📷';
-  btnMuteVid.addEventListener('click', e => {
-    e.stopPropagation(); toggleRemoteVideo(member.socketId, vid, btnMuteVid);
-  });
-  overlay.appendChild(btnMuteVid);
+  const btnVid = document.createElement('button'); btnVid.className='thumb-ctrl-btn'; btnVid.title='Hide video locally'; btnVid.innerHTML='📷';
+  btnVid.addEventListener('click', e => { e.stopPropagation(); toggleRemoteVideo(member.socketId, vid, btnVid); });
+  overlay.appendChild(btnVid);
 
-  const btnSilenceAll = document.createElement('button');
-  btnSilenceAll.className = 'thumb-ctrl-btn thumb-ctrl-silence';
-  btnSilenceAll.title = 'Mute/unmute them for everyone';
-  btnSilenceAll.innerHTML = '🔕';
-  btnSilenceAll.addEventListener('click', e => {
+  const btnSil = document.createElement('button'); btnSil.className='thumb-ctrl-btn thumb-ctrl-silence'; btnSil.title='Mute for everyone'; btnSil.innerHTML='🔕';
+  btnSil.addEventListener('click', e => {
     e.stopPropagation();
     silenceState[member.socketId] = !silenceState[member.socketId];
-    const muted = silenceState[member.socketId];
-    btnSilenceAll.innerHTML = muted ? '🔕' : '🔔';
-    btnSilenceAll.classList.toggle('ctrl-active', muted);
-    socket.emit('room_force_mute', { roomId: currentRoomId, targetId: member.socketId, muted });
-    showToast(muted ? `🔕 Muted ${member.name} for all` : `🔔 Unmuted ${member.name} for all`);
+    const m = silenceState[member.socketId];
+    btnSil.innerHTML = m ? '🔕' : '🔔';
+    btnSil.classList.toggle('ctrl-active', m);
+    socket.emit('room_force_mute', { roomId: currentRoomId, targetId: member.socketId, muted: m });
+    showToast(m ? `🔕 Muted ${member.name} for all` : `🔔 Unmuted ${member.name} for all`);
   });
-  overlay.appendChild(btnSilenceAll);
+  overlay.appendChild(btnSil);
   thumb.appendChild(overlay);
-
   thumb.addEventListener('click', () => focusBigRemote(member));
   return thumb;
 }
 
 function focusBigRemote(member) {
-  const bigWrap = $('room-big-wrap');
-  if (!bigWrap) return;
+  const bigWrap = $('room-big-wrap'); if (!bigWrap) return;
   focusedPeerId = member.socketId;
-  const bigVideo = $('room-big-video');
-  const bigLabel = $('room-big-label');
+  const bv = $('room-big-video'), bl = $('room-big-label');
   const vid = $(`rv-${member.socketId}`);
-  if (vid && vid.srcObject) { bigVideo.srcObject = vid.srcObject; bigVideo.muted = false; }
-  if (bigLabel) bigLabel.textContent = member.name.toUpperCase();
+  if (vid?.srcObject) { bv.srcObject = vid.srcObject; bv.muted = false; }
+  if (bl) bl.textContent = member.name.toUpperCase();
   bigWrap.classList.add('focused-remote');
   document.querySelectorAll('.room-thumb-item').forEach(t => t.classList.remove('active-thumb'));
-  const tEl = $(`rthumb-${member.socketId}`);
-  if (tEl) tEl.classList.add('active-thumb');
+  $(`rthumb-${member.socketId}`)?.classList.add('active-thumb');
 }
 
 function focusBigMe() {
-  const bigWrap = $('room-big-wrap');
-  if (!bigWrap) return;
+  const bigWrap = $('room-big-wrap'); if (!bigWrap) return;
   focusedPeerId = null;
-  const bigVideo = $('room-big-video');
-  const bigLabel = $('room-big-label');
-  if (bigVideo && localStream) { bigVideo.srcObject = localStream; bigVideo.muted = true; }
-  if (bigLabel) bigLabel.textContent = 'YOU';
+  const bv = $('room-big-video'), bl = $('room-big-label');
+  if (bv && localStream) { bv.srcObject = localStream; bv.muted = true; }
+  if (bl) bl.textContent = 'YOU';
   bigWrap.classList.remove('focused-remote');
   document.querySelectorAll('.room-thumb-item').forEach(t => t.classList.remove('active-thumb'));
   document.querySelector('.room-thumb-me')?.classList.add('active-thumb');
@@ -586,31 +542,23 @@ function toggleRemoteVideo(socketId, vid, btn) {
   showToast(remoteVideoOff[socketId] ? '📷 Video hidden locally' : '📷 Video shown');
 }
 
-// ─── Room Chat Messages ───────────────────────────────
+// ─── Room Chat ────────────────────────────────────────
 function addRoomSysMessage(text) {
-  const div = document.createElement('div');
-  div.className = 'sys-msg'; div.textContent = text;
+  const div = document.createElement('div'); div.className='sys-msg'; div.textContent=text;
   roomMessagesContainer.appendChild(div);
   roomMessagesContainer.scrollTop = roomMessagesContainer.scrollHeight;
 }
-
 function addRoomMessage(text, type, from) {
-  const wrap = document.createElement('div');
-  wrap.className = `msg-bubble ${type}`;
-  if (from && type === 'received') {
-    const meta = document.createElement('div');
-    meta.className = 'msg-meta'; meta.textContent = from; wrap.appendChild(meta);
+  const wrap = document.createElement('div'); wrap.className=`msg-bubble ${type}`;
+  if (from && type==='received') {
+    const meta = document.createElement('div'); meta.className='msg-meta'; meta.textContent=from; wrap.appendChild(meta);
   }
-  const body = document.createElement('div'); body.textContent = text; wrap.appendChild(body);
+  const body = document.createElement('div'); body.textContent=text; wrap.appendChild(body);
   roomMessagesContainer.appendChild(wrap);
   roomMessagesContainer.scrollTop = roomMessagesContainer.scrollHeight;
   wrap.style.cssText = `opacity:0;transform:translateX(${type==='sent'?'10px':'-10px'})`;
-  requestAnimationFrame(() => {
-    wrap.style.transition = 'opacity .15s,transform .15s';
-    wrap.style.opacity = '1'; wrap.style.transform = 'none';
-  });
+  requestAnimationFrame(() => { wrap.style.transition='opacity .15s,transform .15s'; wrap.style.opacity='1'; wrap.style.transform='none'; });
 }
-
 function sendRoomMessage() {
   const text = roomChatInput.value.trim();
   if (!text || !socket) return;
@@ -625,47 +573,50 @@ function updateLobbyUI(members) {
   lobbyMemberCount.textContent = members.length;
   const frag = document.createDocumentFragment();
   members.forEach(m => {
-    const pill = document.createElement('div');
-    pill.className = 'member-pill';
-    pill.innerHTML = `<span class="pill-dot"></span>${m.name}${m.socketId === mySocketId ? ' (You)' : ''}`;
+    const pill = document.createElement('div'); pill.className='member-pill';
+    pill.innerHTML = `<span class="pill-dot"></span>${m.name}${m.socketId===mySocketId?' (You)':''}`;
     frag.appendChild(pill);
   });
   lobbyMembersList.innerHTML = '';
   lobbyMembersList.appendChild(frag);
 }
 
+function updateRoomMemberCountDisplay() {
+  if (roomMemberCountDisplay) roomMemberCountDisplay.textContent = roomMembers.length;
+  if (lobbyMemberCount) lobbyMemberCount.textContent = roomMembers.length;
+}
+
 // ─── Socket Init ─────────────────────────────────────
 function initSocket() {
-  if (socket && socket.connected) return;
+  if (socket?.connected) return;
 
   socket = io({
     transports: ['websocket'],
     upgrade: true,
-    reconnectionAttempts: 10,          // FIX: more attempts on rejoin
-    reconnectionDelay: 500,            // FIX: faster first retry (was 1000)
-    reconnectionDelayMax: 3000,        // FIX: cap at 3s (was 4s)
-    timeout: 8000,                     // FIX: fail faster (was 10s)
+    reconnectionAttempts: 10,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 3000,
+    timeout: 8000,
   });
 
   socket.on('connect', () => {
-    mySocketId = socket.id;            // FIX: set immediately on connect
+    mySocketId = socket.id;
     console.log('[SOCKET] Connected:', socket.id);
     if (socket._pendingAction) { socket._pendingAction(); socket._pendingAction = null; }
   });
 
-  socket.on('disconnect', () => { showToast('⚠ Server connection lost'); });
+  socket.on('disconnect', () => showToast('⚠ Server connection lost'));
 
   socket.on('online_count', count => {
     Object.values(onlineCountEls).forEach(el => { if (el) el.textContent = count; });
   });
 
-  // ── Stranger Events ──
+  // ── Stranger Events ──────────────────────────────────
   socket.on('waiting', () => console.log('[SOCKET] In queue'));
 
   socket.on('matched', async ({ partnerName, initiator }) => {
     partnerNameDisplay.textContent = partnerName.toUpperCase();
-    clearMessages();
-    addSysMessage(`Connected to ${partnerName}. Say hello!`);
+    clearMessages(); addSysMessage(`Connected to ${partnerName}. Say hello!`);
     showScreen('chat');
     await startCall(initiator);
   });
@@ -674,8 +625,7 @@ function initSocket() {
     if (!peerConnection) createPeerConnection();
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-      // FIX: flush queued ICE candidates after remote description is set
-      await flushIceQueue('stranger', peerConnection);
+      await flushIceQueue('_stranger', peerConnection);
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
       socket.emit('webrtc_answer', { answer });
@@ -686,27 +636,21 @@ function initSocket() {
     if (!peerConnection) return;
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-      // FIX: flush queued ICE candidates after remote description is set
-      await flushIceQueue('stranger', peerConnection);
-    }
-    catch (e) { console.error('[WebRTC] Set answer error:', e); }
+      await flushIceQueue('_stranger', peerConnection);
+    } catch (e) { console.error('[WebRTC] Set answer error:', e); }
   });
 
   socket.on('webrtc_ice', async ({ candidate }) => {
     if (!peerConnection) return;
-    // FIX: queue if remote description not yet set
-    if (!peerConnection.remoteDescription) {
-      getIceQueue('stranger').push(candidate);
-      return;
-    }
+    if (!peerConnection.remoteDescription) { enqueueIce('_stranger', candidate); return; }
     try { await peerConnection.addIceCandidate(new RTCIceCandidate(candidate)); }
-    catch (e) { console.warn('[WebRTC] ICE error:', e); }
+    catch (e) { console.warn('[WebRTC] ICE:', e.message); }
   });
 
   socket.on('chat_message', ({ from, text }) => addMessage(text, 'received', from));
   socket.on('partner_left', () => { closePeerConnection(); addSysMessage('Stranger has disconnected.'); showModal(); });
 
-  // ── Room Events ──
+  // ── Room Events ──────────────────────────────────────
   socket.on('room_created', ({ roomId, name, members }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
     lobbyRoomId.textContent = roomId;
@@ -717,13 +661,12 @@ function initSocket() {
 
   socket.on('room_joined', ({ roomId, name, members, started }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
-    mySocketId = socket.id;  // FIX: ensure mySocketId is fresh on every join/rejoin
+    mySocketId = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
       showToast(`✓ Rejoined room ${roomId} — reconnecting…`);
-      // FIX: close stale peers before starting fresh session on rejoin
-      closeAllRoomPeers();
-      startRoomSession(true);   // pass isRejoin=true to skip room_start emit
+      closeAllRoomPeers();          // clean slate
+      startRoomSession(true);
     } else {
       updateLobbyUI(members);
       showScreen('roomLobby');
@@ -742,7 +685,8 @@ function initSocket() {
 
     if (sessionActive && screens.roomChat.classList.contains('active')) {
       scheduleBuildRoomVideoLayout();
-      initiateRoomOffer(socketId);
+      // Perfect Negotiation: just create the PC — onnegotiationneeded fires automatically
+      connectToPeer(socketId);
     }
   });
 
@@ -751,50 +695,63 @@ function initSocket() {
     updateRoomMemberCountDisplay();
     addRoomSysMessage(`${name} left the room`);
     showToast(`🔴 ${name} left`);
-
-    if (roomPeers[socketId]) { roomPeers[socketId].close(); delete roomPeers[socketId]; }
-    clearIceQueue(socketId);
-    delete roomStreams[socketId];
-    delete silenceState[socketId];
-
+    closeRoomPC(socketId);
     const box = $(`rbox-${socketId}`) || $(`rthumb-${socketId}`);
     if (box) box.remove();
-
     scheduleBuildRoomVideoLayout();
   });
 
+  // ── Perfect Negotiation: incoming offer ──────────────
   socket.on('room_offer', async ({ fromId, offer }) => {
-    const pc = await createRoomPeerConnection(fromId);
+    const pc = await getOrCreateRoomPC(fromId);
+    const meta = peerMeta[fromId];
+    if (!meta) return;
+
+    const offerCollision = (offer.type === 'offer') &&
+      (meta.makingOffer || pc.signalingState !== 'stable');
+
+    meta.ignoreOffer = !isPolite(fromId) && offerCollision;
+    if (meta.ignoreOffer) {
+      console.log(`[Room] Collision: impolite ignoring offer from ${fromId}`);
+      return;
+    }
+
     try {
+      if (offerCollision) {
+        // Polite peer: rollback own offer, accept incoming
+        await pc.setLocalDescription({ type: 'rollback' });
+      }
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      // FIX: flush queued ICE candidates after remote description is set
       await flushIceQueue(fromId, pc);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit('room_answer', { targetId: fromId, answer });
-    } catch (e) { console.error('[Room] Answer error:', e); }
+      await pc.setLocalDescription();   // auto-creates answer
+      socket.emit('room_answer', { targetId: fromId, answer: pc.localDescription });
+    } catch (e) { console.error(`[Room] Handle offer error from ${fromId}:`, e); }
   });
 
   socket.on('room_answer', async ({ fromId, answer }) => {
     const pc = roomPeers[fromId];
     if (!pc) return;
+    if (pc.signalingState === 'stable') {
+      // Already stable — this is a late/duplicate answer, safely ignore
+      console.log(`[Room] Ignoring late answer from ${fromId} (already stable)`);
+      return;
+    }
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      // FIX: flush queued ICE candidates after remote description is set
       await flushIceQueue(fromId, pc);
-    }
-    catch (e) { console.error('[Room] Set answer error:', e); }
+    } catch (e) { console.error(`[Room] Set answer error from ${fromId}:`, e); }
   });
 
   socket.on('room_ice', async ({ fromId, candidate }) => {
     const pc = roomPeers[fromId];
     if (!pc || !pc.remoteDescription) {
-      // FIX: queue candidates that arrive before remoteDescription is set
-      getIceQueue(fromId).push(candidate);
+      enqueueIce(fromId, candidate);
       return;
     }
+    const meta = peerMeta[fromId];
+    if (meta?.ignoreOffer) return;   // drop ICE from collision round
     try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
-    catch (e) { console.warn('[Room] ICE error:', e); }
+    catch (e) { console.warn(`[Room] ICE from ${fromId}:`, e.message); }
   });
 
   socket.on('room_message', ({ from, text }) => addRoomMessage(text, 'received', from));
@@ -817,76 +774,49 @@ function initSocket() {
     showToast(`⚠ ${msg}`, 5000);
     closeAllRoomPeers(); stopLocalMedia();
     if (socket) { socket.disconnect(); socket = null; }
-    currentRoomId = null; roomMembers = []; roomPeers = {}; roomStreams = {}; silenceState = {};
+    currentRoomId = null; roomMembers = []; silenceState = {};
     roomMuted = false; roomCamOff = false;
     showScreen('landing');
   });
 }
 
-function updateRoomMemberCountDisplay() {
-  if (roomMemberCountDisplay) roomMemberCountDisplay.textContent = roomMembers.length;
-  if (lobbyMemberCount) lobbyMemberCount.textContent = roomMembers.length;
-}
-
 // ─── Start Room Session ───────────────────────────────
-// FIX: isRejoin param — skip room_start emit on rejoin (server already knows)
 async function startRoomSession(isRejoin = false) {
-  // FIX: ensure fresh media stream before connecting
-  await getLocalMedia();
-
+  await getLocalMedia();           // always get fresh stream
   roomIdDisplay.textContent = currentRoomId;
   showScreen('roomChat');
   buildRoomVideoLayout();
   reassignStreams();
+  addRoomSysMessage(isRejoin ? 'Reconnected! Re-establishing video…' : 'Session started! Video connecting…');
+  if (!isRejoin) socket.emit('room_start', { roomId: currentRoomId });
 
-  if (isRejoin) {
-    addRoomSysMessage('Reconnected! Re-establishing video…');
-  } else {
-    addRoomSysMessage('Session started! Video connecting…');
-    socket.emit('room_start', { roomId: currentRoomId });
-  }
-
-  const myIndex = roomMembers.findIndex(m => m.socketId === mySocketId);
-  const targets = roomMembers.slice(0, myIndex);
-
-  if (targets.length > 0) {
-    await Promise.all(targets.map(peer => initiateRoomOffer(peer.socketId)));
-  }
-
-  // FIX: on rejoin, also offer to ALL other members (not just those before us)
-  if (isRejoin) {
-    const allOthers = roomMembers.filter(m => m.socketId !== mySocketId);
-    await Promise.all(allOthers.map(peer => initiateRoomOffer(peer.socketId)));
-  }
+  // Connect to all existing peers
+  // Perfect Negotiation handles who sends the offer automatically
+  const peers = roomMembers.filter(m => m.socketId !== mySocketId);
+  await Promise.all(peers.map(m => connectToPeer(m.socketId)));
 }
 
 // ─── Stranger chat helpers ────────────────────────────
 function clearMessages() { messagesContainer.innerHTML = ''; }
-
 function addSysMessage(text) {
-  const div = document.createElement('div'); div.className = 'sys-msg'; div.textContent = text;
+  const div = document.createElement('div'); div.className='sys-msg'; div.textContent=text;
   messagesContainer.appendChild(div);
   messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
-
 function addMessage(text, type, from) {
-  const wrap = document.createElement('div'); wrap.className = `msg-bubble ${type}`;
-  if (from && type === 'received') {
-    const meta = document.createElement('div'); meta.className = 'msg-meta'; meta.textContent = from; wrap.appendChild(meta);
+  const wrap = document.createElement('div'); wrap.className=`msg-bubble ${type}`;
+  if (from && type==='received') {
+    const meta = document.createElement('div'); meta.className='msg-meta'; meta.textContent=from; wrap.appendChild(meta);
   }
-  const body = document.createElement('div'); body.textContent = text; wrap.appendChild(body);
+  const body = document.createElement('div'); body.textContent=text; wrap.appendChild(body);
   messagesContainer.appendChild(wrap);
   messagesContainer.scrollTop = messagesContainer.scrollHeight;
   wrap.style.cssText = `opacity:0;transform:translateX(${type==='sent'?'10px':'-10px'})`;
-  requestAnimationFrame(() => {
-    wrap.style.transition = 'opacity .15s,transform .15s';
-    wrap.style.opacity = '1'; wrap.style.transform = 'none';
-  });
+  requestAnimationFrame(() => { wrap.style.transition='opacity .15s,transform .15s'; wrap.style.opacity='1'; wrap.style.transform='none'; });
 }
-
 function sendMessage() {
   const text = chatInput.value.trim();
-  if (!text || !socket || !socket.connected) return;
+  if (!text || !socket?.connected) return;
   socket.emit('chat_message', { text });
   addMessage(text, 'sent', null);
   chatInput.value = '';
@@ -899,29 +829,24 @@ function hideModal() { modalLeft.style.display = 'none'; }
 // ─── Stranger controls ────────────────────────────────
 function toggleMute() {
   isMuted = !isMuted;
-  if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
+  if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
   btnMute.classList.toggle('active', isMuted);
   btnMute.querySelector('.icon-unmuted').style.display = isMuted ? 'none' : 'block';
   btnMute.querySelector('.icon-muted').style.display   = isMuted ? 'block' : 'none';
   showToast(isMuted ? '🎤 Mic muted' : '🎤 Mic on');
 }
-
 function toggleCamera() {
   isCamOff = !isCamOff;
-  if (localStream) localStream.getVideoTracks().forEach(t => { t.enabled = !isCamOff; });
+  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = !isCamOff);
   btnVideoToggle.classList.toggle('active', isCamOff);
   btnVideoToggle.querySelector('.icon-cam-on').style.display  = isCamOff ? 'none' : 'block';
   btnVideoToggle.querySelector('.icon-cam-off').style.display = isCamOff ? 'block' : 'none';
   showToast(isCamOff ? '📷 Camera off' : '📷 Camera on');
 }
-
 function skipStranger() {
-  closePeerConnection();
-  addSysMessage('Searching for next stranger...');
-  socket.emit('skip');
-  showScreen('waiting');
+  closePeerConnection(); addSysMessage('Searching for next stranger...');
+  socket.emit('skip'); showScreen('waiting');
 }
-
 function endSession() {
   closePeerConnection(); stopLocalMedia();
   if (socket) { socket.disconnect(); socket = null; }
@@ -938,28 +863,26 @@ function endSession() {
 // ─── Room controls ────────────────────────────────────
 function toggleRoomMute() {
   roomMuted = !roomMuted;
-  if (localStream) localStream.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
+  if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = !roomMuted);
   btnRoomMute.classList.toggle('active', roomMuted);
   btnRoomMute.querySelector('.icon-unmuted').style.display = roomMuted ? 'none' : 'block';
   btnRoomMute.querySelector('.icon-muted').style.display   = roomMuted ? 'block' : 'none';
   socket.emit('room_media_state', { roomId: currentRoomId, audioMuted: roomMuted, videoOff: roomCamOff });
   showToast(roomMuted ? '🎤 Mic muted' : '🎤 Mic on');
 }
-
 function toggleRoomCam() {
   roomCamOff = !roomCamOff;
-  if (localStream) localStream.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
+  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = !roomCamOff);
   btnRoomCam.classList.toggle('active', roomCamOff);
   btnRoomCam.querySelector('.icon-cam-on').style.display  = roomCamOff ? 'none' : 'block';
   btnRoomCam.querySelector('.icon-cam-off').style.display = roomCamOff ? 'block' : 'none';
   socket.emit('room_media_state', { roomId: currentRoomId, audioMuted: roomMuted, videoOff: roomCamOff });
   showToast(roomCamOff ? '📷 Camera off' : '📷 Camera on');
 }
-
 function leaveRoom() {
   closeAllRoomPeers(); stopLocalMedia();
   if (socket) { socket.disconnect(); socket = null; }
-  currentRoomId = null; roomMembers = []; roomPeers = {}; roomStreams = {}; silenceState = {};
+  currentRoomId = null; roomMembers = []; silenceState = {};
   roomMuted = false; roomCamOff = false;
   showScreen('landing');
 }
@@ -972,15 +895,13 @@ async function startStrangerFlow() {
   await getLocalMedia();
   ensureSocket(() => socket.emit('join_queue', { name: myName }));
 }
-
 async function startCreateRoomFlow() {
   const name = createNameInput.value.trim() || 'Host';
-  const pass  = createPassInput.value.trim();
+  const pass = createPassInput.value.trim();
   if (!pass) { showToast('⚠ Please set a password for the room'); return; }
   await getLocalMedia();
   ensureSocket(() => socket.emit('create_room', { name, password: pass }));
 }
-
 async function startJoinRoomFlow() {
   const name   = joinNameInput.value.trim() || 'User';
   const roomId = joinRoomIdInput.value.trim();
@@ -992,10 +913,10 @@ async function startJoinRoomFlow() {
 }
 
 function ensureSocket(action) {
-  if (!socket || !socket.connected) {
+  if (!socket?.connected) {
     initSocket();
     if (socket.connected) { mySocketId = socket.id; action(); }
-    else socket.on('connect', () => { mySocketId = socket.id; action(); });
+    else socket.once('connect', () => { mySocketId = socket.id; action(); });
   } else {
     mySocketId = socket.id;
     action();
@@ -1006,19 +927,16 @@ function ensureSocket(action) {
 $('btn-mode-stranger').addEventListener('click', () => showScreen('nameStranger'));
 $('btn-mode-create').addEventListener('click', () => showScreen('createRoom'));
 $('btn-mode-join').addEventListener('click', () => showScreen('joinRoom'));
-
 $('btn-back-stranger').addEventListener('click', () => showScreen('landing'));
 $('btn-back-create').addEventListener('click', () => showScreen('landing'));
 $('btn-back-join').addEventListener('click', () => showScreen('landing'));
 
 btnStartStranger.addEventListener('click', startStrangerFlow);
-strangerNameInput.addEventListener('keydown', e => { if (e.key === 'Enter') startStrangerFlow(); });
+strangerNameInput.addEventListener('keydown', e => { if (e.key==='Enter') startStrangerFlow(); });
 
 $('btn-do-create-room').addEventListener('click', startCreateRoomFlow);
 $('btn-do-join-room').addEventListener('click', startJoinRoomFlow);
-joinRoomIdInput.addEventListener('input', e => {
-  e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
-});
+joinRoomIdInput.addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g,'').slice(0,6); });
 
 btnStartRoom.addEventListener('click', () => startRoomSession(false));
 $('btn-cancel-room').addEventListener('click', leaveRoom);
@@ -1034,21 +952,18 @@ btnVideoToggle.addEventListener('click', toggleCamera);
 btnSkip.addEventListener('click', skipStranger);
 btnEnd.addEventListener('click', endSession);
 btnSend.addEventListener('click', sendMessage);
-chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+chatInput.addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
 
 btnRoomMute.addEventListener('click', toggleRoomMute);
 btnRoomCam.addEventListener('click', toggleRoomCam);
 btnRoomLeave.addEventListener('click', leaveRoom);
 btnRoomSend.addEventListener('click', sendRoomMessage);
-roomChatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendRoomMessage(); } });
+roomChatInput.addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendRoomMessage(); } });
 
 $('modal-next').addEventListener('click', () => {
   hideModal(); closePeerConnection(); showScreen('waiting');
-  if (socket && socket.connected) socket.emit('join_queue', { name: myName });
-  else {
-    initSocket();
-    socket.on('connect', () => { mySocketId = socket.id; socket.emit('join_queue', { name: myName }); });
-  }
+  if (socket?.connected) socket.emit('join_queue', { name: myName });
+  else { initSocket(); socket.once('connect', () => { mySocketId = socket.id; socket.emit('join_queue', { name: myName }); }); }
 });
 $('modal-home').addEventListener('click', () => { hideModal(); endSession(); });
 
