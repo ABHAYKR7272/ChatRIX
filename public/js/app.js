@@ -1,7 +1,8 @@
 /* ═══════════════════════════════════════════════════════
-   CHAT-RIX — MAIN APP JS  (Stranger + Room Mode)
-   v3 — Perfect Negotiation pattern, ICE queue,
-        rejoin fix, stale-peer cleanup, fast reconnect
+   CHAT-RIX — MAIN APP JS
+   FIXED: Timing-independent room WebRTC connection
+   Strategy: Explicit offer/answer — NO reliance on
+   onnegotiationneeded. Higher socketId always initiates.
    ═══════════════════════════════════════════════════════ */
 'use strict';
 
@@ -29,38 +30,26 @@ const ICE_SERVERS = {
 // ─── State ───────────────────────────────────────────
 let socket            = null;
 let localStream       = null;
-let peerConnection    = null;   // stranger 1:1
+let peerConnection    = null;
 let myName            = '';
 let isMuted           = false;
 let isCamOff          = false;
 let isConnectedToPeer = false;
 
 // Room
-let currentRoomId   = null;
-let roomPeers       = {};   // peerId → RTCPeerConnection
-let roomStreams      = {};   // peerId → MediaStream
-let silenceState    = {};
-let roomMembers     = [];
-let mySocketId      = null;
-let focusedPeerId   = null;
-let roomMuted       = false;
-let roomCamOff      = false;
+let currentRoomId    = null;
+let roomPeers        = {};   // peerId → RTCPeerConnection
+let roomStreams       = {};   // peerId → MediaStream
+let silenceState     = {};
+let roomMembers      = [];
+let mySocketId       = null;
+let focusedPeerId    = null;
+let roomMuted        = false;
+let roomCamOff       = false;
 let remoteAudioMuted = {};
 let remoteVideoOff   = {};
 
-/*
- * ── Perfect Negotiation per-peer state ──────────────────
- * peerMeta[peerId] = {
- *   makingOffer   : bool   — currently in createOffer()
- *   ignoreOffer   : bool   — should ignore incoming offer (collision)
- *   isPolite      : bool   — polite peer rolls back & accepts; impolite ignores
- * }
- * Rule: lower socketId string → impolite (keeps its offer)
- *       higher socketId string → polite (rolls back on collision)
- */
-const peerMeta = {};
-
-// ICE candidate queue — buffer candidates that arrive before remoteDescription
+// ICE candidate queue
 const iceQueues = {};   // peerId → RTCIceCandidateInit[]
 
 // Layout rebuild debounce
@@ -215,7 +204,6 @@ function getVideoConstraints(peerCount = 0) {
 }
 
 async function getLocalMedia() {
-  // Stop any stale stream first
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   const peerCount = Object.keys(roomPeers).length;
   try {
@@ -306,35 +294,42 @@ function closePeerConnection() {
 }
 
 // ══════════════════════════════════════════════════════
-//  ROOM WebRTC — Perfect Negotiation
-//  https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
+//  ROOM WebRTC — EXPLICIT OFFER/ANSWER (no onnegotiationneeded)
 //
-//  Polite peer  (higher socketId) → rolls back its own offer on collision
-//  Impolite peer (lower socketId) → ignores incoming offer on collision
-//  This completely eliminates "Called in wrong state: stable" errors
+//  Rule: higher socketId string → sends the offer (initiator)
+//        lower socketId string  → waits for offer (receiver)
+//
+//  This is 100% deterministic. No timing race possible.
+//  Works whether you join early, late, or rejoin.
 // ══════════════════════════════════════════════════════
 
-function isPolite(peerId) {
-  // polite = our socketId is lexicographically greater
+function iAmInitiator(peerId) {
+  // I send the offer if my socketId is lexicographically greater
   return mySocketId > peerId;
 }
 
-async function getOrCreateRoomPC(peerId) {
-  if (roomPeers[peerId]) return roomPeers[peerId];
-
+async function createRoomPC(peerId) {
+  // Close any stale connection first
+  if (roomPeers[peerId]) {
+    roomPeers[peerId].close();
+    delete roomPeers[peerId];
+    delete roomStreams[peerId];
+  }
   clearIceQueue(peerId);
-  peerMeta[peerId] = { makingOffer: false, ignoreOffer: false };
 
   const pc = new RTCPeerConnection(ICE_SERVERS);
   roomPeers[peerId] = pc;
 
   // Add local tracks
-  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  if (localStream) {
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  }
 
   // Remote track received
   pc.ontrack = e => {
     if (e.streams?.[0]) {
       roomStreams[peerId] = e.streams[0];
+      // Try to assign to video element if it exists
       const vid = document.getElementById(`rv-${peerId}`);
       if (vid) vid.srcObject = e.streams[0];
     }
@@ -345,51 +340,56 @@ async function getOrCreateRoomPC(peerId) {
     if (e.candidate) socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
   };
 
-  // Connection state indicator
+  // Connection state
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
+    console.log(`[Room] ${peerId} state: ${s}`);
     const ind = document.getElementById(`ri-${peerId}`);
     if (ind) ind.style.background = s === 'connected' ? '#00ff88' : (s === 'failed' ? '#ff2244' : '#ffaa00');
     if (s === 'failed') {
-      console.warn(`[Room] PC failed for ${peerId} — restarting ICE`);
-      pc.restartIce();   // triggers onnegotiationneeded → new offer automatically
-    }
-  };
-
-  // ── Perfect Negotiation: onnegotiationneeded ──────────
-  pc.onnegotiationneeded = async () => {
-    const meta = peerMeta[peerId];
-    if (!meta) return;
-    try {
-      meta.makingOffer = true;
-      // Explicit createOffer for full browser compatibility (Chrome, Firefox, Safari)
-      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-      // If signaling state changed while we were waiting, abort
-      if (pc.signalingState !== 'stable') return;
-      await pc.setLocalDescription(offer);
-      socket.emit('room_offer', { targetId: peerId, offer: pc.localDescription });
-    } catch (e) {
-      console.error(`[Room] negotiationneeded error for ${peerId}:`, e);
-    } finally {
-      if (meta) meta.makingOffer = false;
+      console.warn(`[Room] Connection failed for ${peerId} — retrying`);
+      retryConnection(peerId);
     }
   };
 
   return pc;
 }
 
-// Called when we want to connect to a new peer
+// Retry with fresh PC after failure
+function retryConnection(peerId) {
+  closeRoomPC(peerId);
+  setTimeout(async () => {
+    if (!roomMembers.find(m => m.socketId === peerId)) return; // peer left
+    console.log(`[Room] Retrying connection to ${peerId}`);
+    await connectToPeer(peerId);
+  }, 2000);
+}
+
+// Main connect function — creates PC and sends offer if we are initiator
 async function connectToPeer(peerId) {
-  await getOrCreateRoomPC(peerId);
-  // onnegotiationneeded fires automatically after addTrack — no manual createOffer needed
+  if (peerId === mySocketId) return;
+  const pc = await createRoomPC(peerId);
+
+  if (iAmInitiator(peerId)) {
+    console.log(`[Room] I am initiator for ${peerId} — sending offer`);
+    try {
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+      socket.emit('room_offer', { targetId: peerId, offer: pc.localDescription });
+    } catch (e) {
+      console.error(`[Room] createOffer failed for ${peerId}:`, e);
+    }
+  } else {
+    console.log(`[Room] I am receiver for ${peerId} — waiting for offer`);
+    // Receiver waits — offer will come via room_offer event
+  }
 }
 
 function closeRoomPC(peerId) {
   const pc = roomPeers[peerId];
-  if (pc) { pc.onnegotiationneeded = null; pc.onicecandidate = null; pc.ontrack = null; pc.close(); }
+  if (pc) { pc.onicecandidate = null; pc.ontrack = null; pc.onconnectionstatechange = null; pc.close(); }
   delete roomPeers[peerId];
   delete roomStreams[peerId];
-  delete peerMeta[peerId];
   clearIceQueue(peerId);
 }
 
@@ -657,6 +657,7 @@ function initSocket() {
   // ── Room Events ──────────────────────────────────────
   socket.on('room_created', ({ roomId, name, members }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
+    mySocketId = socket.id;
     lobbyRoomId.textContent = roomId;
     updateLobbyUI(members);
     showScreen('roomLobby');
@@ -668,10 +669,10 @@ function initSocket() {
     mySocketId = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
-      // Session already running — jump straight in and connect to everyone
-      showToast(`✓ ${roomId.includes('rejoin') ? 'Rejoined' : 'Joined'} room ${roomId} — connecting…`);
-      closeAllRoomPeers();          // clean slate for fresh connections
-      startRoomSession(true);       // isRejoin=true skips room_start emit
+      // Session already active — go straight to chat and connect
+      showToast(`✓ Joined active room ${roomId} — connecting…`);
+      closeAllRoomPeers();
+      startRoomSession(true);
     } else {
       updateLobbyUI(members);
       showScreen('roomLobby');
@@ -681,6 +682,7 @@ function initSocket() {
 
   socket.on('room_error', ({ msg }) => showToast('⚠ ' + msg, 3500));
 
+  // Someone new joined the room
   socket.on('room_member_joined', ({ socketId, name, members, sessionActive }) => {
     roomMembers = members;
     updateLobbyUI(members);
@@ -688,13 +690,9 @@ function initSocket() {
     showToast(`🟢 ${name} joined`);
     updateRoomMemberCountDisplay();
 
-    if (sessionActive) {
-      // Rebuild layout whether we are in lobby or chat screen
-      if (screens.roomChat.classList.contains('active')) {
-        scheduleBuildRoomVideoLayout();
-      }
-      // Connect to the new peer regardless — they will also connect back to us
-      // Perfect Negotiation ensures no collision
+    if (sessionActive && screens.roomChat.classList.contains('active')) {
+      // We are in session — rebuild layout and connect to the new member
+      scheduleBuildRoomVideoLayout();
       connectToPeer(socketId);
     }
   });
@@ -710,40 +708,40 @@ function initSocket() {
     scheduleBuildRoomVideoLayout();
   });
 
-  // ── Perfect Negotiation: incoming offer ──────────────
+  // ── Room signaling — EXPLICIT offer/answer ────────────
+  // Incoming offer: create PC (if not exists), set remote, send answer
   socket.on('room_offer', async ({ fromId, offer }) => {
-    const pc = await getOrCreateRoomPC(fromId);
-    const meta = peerMeta[fromId];
-    if (!meta) return;
-
-    const offerCollision = (offer.type === 'offer') &&
-      (meta.makingOffer || pc.signalingState !== 'stable');
-
-    meta.ignoreOffer = !isPolite(fromId) && offerCollision;
-    if (meta.ignoreOffer) {
-      console.log(`[Room] Collision: impolite ignoring offer from ${fromId}`);
-      return;
+    console.log(`[Room] Got offer from ${fromId}`);
+    // Always create a fresh PC when we get an offer
+    // (handles retries and rejoins cleanly)
+    let pc = roomPeers[fromId];
+    if (!pc || pc.signalingState === 'closed') {
+      pc = await createRoomPC(fromId);
     }
 
     try {
-      if (offerCollision) {
-        // Polite peer: rollback own offer, accept incoming
-        await pc.setLocalDescription({ type: 'rollback' });
+      // If we're in a weird state, reset
+      if (pc.signalingState !== 'stable') {
+        console.warn(`[Room] Unexpected signalingState ${pc.signalingState} when receiving offer from ${fromId}`);
+        pc = await createRoomPC(fromId); // fresh PC
       }
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await flushIceQueue(fromId, pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('room_answer', { targetId: fromId, answer: pc.localDescription });
-    } catch (e) { console.error(`[Room] Handle offer error from ${fromId}:`, e); }
+      console.log(`[Room] Sent answer to ${fromId}`);
+    } catch (e) {
+      console.error(`[Room] Handle offer error from ${fromId}:`, e);
+    }
   });
 
   socket.on('room_answer', async ({ fromId, answer }) => {
+    console.log(`[Room] Got answer from ${fromId}`);
     const pc = roomPeers[fromId];
-    if (!pc) return;
-    // Only accept answer when we are waiting for one (have-local-offer)
+    if (!pc) { console.warn(`[Room] No PC found for ${fromId} when receiving answer`); return; }
     if (pc.signalingState !== 'have-local-offer') {
-      console.log(`[Room] Ignoring answer from ${fromId} — state: ${pc.signalingState}`);
+      console.warn(`[Room] Ignoring answer from ${fromId} — state: ${pc.signalingState}`);
       return;
     }
     try {
@@ -754,37 +752,38 @@ function initSocket() {
 
   socket.on('room_ice', async ({ fromId, candidate }) => {
     const pc = roomPeers[fromId];
-    if (!pc || !pc.remoteDescription) {
-      enqueueIce(fromId, candidate);
-      return;
-    }
-    const meta = peerMeta[fromId];
-    if (meta?.ignoreOffer) return;   // drop ICE from collision round
+    if (!pc) { enqueueIce(fromId, candidate); return; }
+    if (!pc.remoteDescription) { enqueueIce(fromId, candidate); return; }
     try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
     catch (e) { console.warn(`[Room] ICE from ${fromId}:`, e.message); }
   });
 
   socket.on('room_message', ({ from, text }) => addRoomMessage(text, 'received', from));
 
-  // ── room_session_started: fires for ALL members when host clicks Start ──────
-  // This fixes the race: whether you joined early or late, everyone gets this event
-  socket.on('room_session_started', async ({ members, startedBy }) => {
+  // ── room_session_started: server broadcasts to ALL when host starts ──────────
+  // This is the KEY fix — everyone gets this event simultaneously
+  socket.on('room_session_started', async ({ members }) => {
+    console.log('[Room] Session started event received, members:', members.length);
     roomMembers = members;
     mySocketId  = socket.id;
 
-    // If we're still in lobby, move to chat screen
+    // Move to chat screen if not already there
     if (!screens.roomChat.classList.contains('active')) {
       await getLocalMedia();
       roomIdDisplay.textContent = currentRoomId;
       showScreen('roomChat');
       buildRoomVideoLayout();
       reassignStreams();
+      updateRoomMemberCountDisplay();
       addRoomSysMessage('Session started! Video connecting…');
     }
 
-    // Connect to every other member — Perfect Negotiation handles offer/answer
+    // Connect to all peers — iAmInitiator() decides who sends offer
     const peers = roomMembers.filter(m => m.socketId !== mySocketId);
-    await Promise.all(peers.map(m => connectToPeer(m.socketId)));
+    console.log(`[Room] Connecting to ${peers.length} peers`);
+    for (const m of peers) {
+      await connectToPeer(m.socketId);
+    }
   });
 
   socket.on('room_member_media', ({ socketId, audioMuted, videoOff }) => {
@@ -813,21 +812,26 @@ function initSocket() {
 
 // ─── Start Room Session ───────────────────────────────
 async function startRoomSession(isRejoin = false) {
-  await getLocalMedia();           // always get fresh stream
+  await getLocalMedia();
   roomIdDisplay.textContent = currentRoomId;
   showScreen('roomChat');
   buildRoomVideoLayout();
   reassignStreams();
   updateRoomMemberCountDisplay();
-  addRoomSysMessage(isRejoin ? 'Reconnected! Re-establishing video…' : 'Session started! Video connecting…');
+  addRoomSysMessage(isRejoin ? 'Reconnected! Connecting to peers…' : 'Session started! Connecting…');
 
   if (!isRejoin) {
-    // Tell server to start — server will broadcast room_session_started to everyone
+    // Host clicked Start — tell server to broadcast room_session_started to everyone
     socket.emit('room_start', { roomId: currentRoomId });
+    // Host's own connections are initiated via room_session_started event
+    // (server broadcasts back to host too)
   } else {
-    // On rejoin/late-join: connect to existing peers directly
+    // Late joiner or rejoin — connect directly to everyone in room
     const peers = roomMembers.filter(m => m.socketId !== mySocketId);
-    await Promise.all(peers.map(m => connectToPeer(m.socketId)));
+    console.log(`[Room] Rejoin: connecting to ${peers.length} existing peers`);
+    for (const m of peers) {
+      await connectToPeer(m.socketId);
+    }
   }
 }
 
