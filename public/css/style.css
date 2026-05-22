@@ -1,5 +1,7 @@
 /* ═══════════════════════════════════════════════════════
-   CHAT-RIX — CYBER RGB STYLESHEET
+   CHAT-RIX — CYBER RGB STYLESHEET (PERFORMANCE OPTIMIZED)
+   Changes: GPU-accelerated animations, specific transitions,
+   will-change hints, contain on video boxes, faster scanlines
    ═══════════════════════════════════════════════════════ */
 
 :root {
@@ -49,8 +51,12 @@ html, body {
 #particleCanvas {
   position: fixed; inset: 0;
   z-index: 0; pointer-events: none;
+  /* PERF: promote canvas to its own GPU layer */
+  will-change: transform;
+  transform: translateZ(0);
 }
 
+/* PERF: scanlines now animates transform (GPU) instead of background-position (CPU repaint) */
 .scanlines {
   position: fixed; inset: 0; z-index: 1; pointer-events: none;
   background: repeating-linear-gradient(
@@ -61,10 +67,11 @@ html, body {
     rgba(0, 0, 0, 0.08) 4px
   );
   animation: scanMove 8s linear infinite;
+  will-change: transform;
 }
 @keyframes scanMove {
-  from { background-position: 0 0; }
-  to   { background-position: 0 400px; }
+  from { transform: translateY(0); }
+  to   { transform: translateY(400px); }
 }
 
 .noise-overlay {
@@ -78,11 +85,11 @@ html, body {
   position: fixed; inset: 0; z-index: 10;
   display: none; flex-direction: column;
   align-items: center; justify-content: center;
-  opacity: 0; transition: opacity 0.4s ease;
+  opacity: 0; transition: opacity 0.3s ease;  /* PERF: 0.4s→0.3s */
 }
 .screen.active { display: flex; opacity: 1; }
-.screen.fade-in { animation: fadeIn 0.4s ease forwards; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.screen.fade-in { animation: fadeIn 0.3s ease forwards; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* ══════════════════════════════════════════════════
    LANDING SCREEN
@@ -118,6 +125,7 @@ html, body {
     0 0 80px rgba(0,255,255,0.2);
   position: relative;
   animation: glitchMain 6s infinite;
+  will-change: transform;  /* PERF: prep GPU layer for glitch transform */
 }
 .logo-glitch::before,
 .logo-glitch::after {
@@ -165,6 +173,7 @@ html, body {
   margin-top: 8px;
 }
 
+/* PERF: rgbSlide uses background-position on a static element (no layout) — fine */
 .rgb-bar {
   height: 2px;
   margin-top: 16px;
@@ -196,6 +205,7 @@ html, body {
   border-radius: 50%;
   box-shadow: 0 0 8px var(--green);
   animation: pulseDot 1.5s ease-in-out infinite;
+  will-change: opacity, transform;
 }
 @keyframes pulseDot {
   0%,100% { opacity: 1; transform: scale(1); }
@@ -229,7 +239,8 @@ html, body {
   font-size: 1rem;
   letter-spacing: 1px;
   outline: none;
-  transition: border-color 0.3s, box-shadow 0.3s;
+  /* PERF: specific properties instead of 'transition: all' */
+  transition: border-color 0.2s, box-shadow 0.2s;
   caret-color: var(--cyan);
 }
 .cyber-input::placeholder { color: var(--text-dim); }
@@ -245,7 +256,8 @@ html, body {
 .input-border-anim {
   position: absolute; bottom: 0; left: 0; right: 0; height: 1px;
   background: linear-gradient(90deg, transparent, var(--cyan), transparent);
-  transform: scaleX(0); transition: transform 0.4s ease;
+  transform: scaleX(0); transition: transform 0.3s ease;  /* PERF: 0.4s→0.3s */
+  will-change: transform;
 }
 .cyber-input:focus ~ .input-border-anim { transform: scaleX(1); }
 
@@ -262,9 +274,11 @@ html, body {
   font-weight: 700;
   letter-spacing: 4px;
   cursor: pointer;
-  transition: all 0.3s;
+  /* PERF: specific properties, not 'all' */
+  transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
   text-shadow: 0 0 10px rgba(0,255,255,0.6);
   box-shadow: 0 0 20px rgba(0,255,255,0.1), inset 0 0 20px rgba(0,255,255,0.02);
+  will-change: transform;
 }
 .btn-launch:hover {
   background: rgba(0,255,255,0.08);
@@ -275,7 +289,7 @@ html, body {
 .btn-glow {
   position: absolute; inset: -2px;
   background: linear-gradient(135deg, rgba(0,255,255,0.3), transparent, rgba(255,0,170,0.2));
-  opacity: 0; transition: opacity 0.3s;
+  opacity: 0; transition: opacity 0.2s;
   pointer-events: none;
 }
 .btn-launch:hover .btn-glow { opacity: 1; }
@@ -327,7 +341,7 @@ html, body {
   text-shadow: 0 0 20px rgba(0,255,255,0.5);
 }
 
-/* Radar */
+/* Radar — will-change on the sweep for GPU compositing */
 .radar-wrap { position: relative; }
 .radar {
   width: 180px; height: 180px;
@@ -354,8 +368,9 @@ html, body {
     transparent 60deg
   );
   animation: radarSpin 2s linear infinite;
+  will-change: transform;
 }
-@keyframes radarSpin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+@keyframes radarSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .radar-dot {
   position: absolute; width: 6px; height: 6px;
   background: var(--cyan); border-radius: 50%;
@@ -373,6 +388,7 @@ html, body {
   width: 6px; height: 6px;
   background: var(--cyan); border-radius: 50%;
   animation: dotBounce 1.4s ease-in-out infinite;
+  will-change: opacity, transform;
 }
 .wait-dots span:nth-child(1) { animation-delay: 0s; }
 .wait-dots span:nth-child(2) { animation-delay: 0.15s; }
@@ -393,7 +409,7 @@ html, body {
   background: transparent; border: 1px solid rgba(255,34,68,0.4);
   color: var(--red); font-family: var(--font-mono); font-size: 0.72rem;
   letter-spacing: 3px; padding: 10px 28px; cursor: pointer;
-  border-radius: var(--radius); transition: all 0.3s;
+  border-radius: var(--radius); transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
 }
 .btn-cancel:hover {
   background: rgba(255,34,68,0.1);
@@ -435,6 +451,7 @@ html, body {
   width: 7px; height: 7px; background: var(--green);
   border-radius: 50%; box-shadow: 0 0 8px var(--green);
   animation: pulseDot 1.5s ease-in-out infinite;
+  will-change: opacity, transform;
 }
 .online-tag {
   font-family: var(--font-mono); font-size: 0.65rem;
@@ -447,12 +464,13 @@ html, body {
   overflow: hidden; min-height: 0;
 }
 
-/* Video Panel */
+/* Video Panel — PERF: contain:paint isolates repaints to this box */
 .video-panel {
-  flex: 1.2; display: flex; flex-direction: row;  /* ← CHANGED: column → row (side by side) */
+  flex: 1.2; display: flex; flex-direction: row;
   gap: 4px; padding: 8px;
   background: #010608;
   position: relative; min-width: 0;
+  contain: layout paint;
 }
 .video-box {
   flex: 1; position: relative; overflow: hidden;
@@ -460,7 +478,8 @@ html, body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   min-height: 0;
-  aspect-ratio: 16/9;    /* ← ADDED: perfect 16:9 ratio */
+  aspect-ratio: 16/9;
+  contain: paint;  /* PERF: video repaints stay inside the box */
 }
 .video-box video {
   width: 100%; height: 100%;
@@ -480,7 +499,7 @@ html, body {
   font-family: var(--font-mono); font-size: 0.75rem;
   letter-spacing: 2px; color: var(--text-dim);
   background: rgba(0,0,0,0.7);
-  transition: opacity 0.3s;
+  transition: opacity 0.2s;
 }
 .video-overlay-text.hidden { opacity: 0; pointer-events: none; }
 
@@ -516,6 +535,8 @@ html, body {
   padding: 12px; display: flex;
   flex-direction: column; gap: 8px;
   scroll-behavior: smooth;
+  /* PERF: contain reduces scroll repaint area */
+  contain: paint;
 }
 .messages-container::-webkit-scrollbar { width: 3px; }
 .messages-container::-webkit-scrollbar-track { background: transparent; }
@@ -564,7 +585,7 @@ html, body {
   color: var(--text-bright);
   font-family: var(--font-body); font-size: 0.9rem;
   padding: 9px 12px; outline: none;
-  transition: border-color 0.2s;
+  transition: border-color 0.15s;  /* PERF: specific + faster */
   caret-color: var(--cyan);
 }
 .msg-input::placeholder { color: var(--text-dim); }
@@ -575,7 +596,8 @@ html, body {
   background: var(--cyan); color: #000;
   border: none; border-radius: var(--radius);
   cursor: pointer; display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0; transition: all 0.2s;
+  flex-shrink: 0; transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
+  will-change: transform;
 }
 .btn-send:hover { background: #fff; box-shadow: 0 0 15px rgba(0,255,255,0.5); }
 .btn-send:active { transform: scale(0.95); }
@@ -598,7 +620,9 @@ html, body {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 0.6rem; letter-spacing: 2px;
-  cursor: pointer; transition: all 0.2s;
+  cursor: pointer;
+  /* PERF: specific props, not 'all' */
+  transition: color 0.15s, border-color 0.15s, background 0.15s, box-shadow 0.15s;
   min-width: 70px;
 }
 .ctrl-btn:hover {
@@ -627,7 +651,7 @@ html, body {
   box-shadow: 0 0 15px rgba(255,34,68,0.2);
 }
 
-/* ─── TOAST ──────────────────────────────────────── */
+/* ─── TOAST — GPU composited ─────────────────────── */
 .toast {
   position: fixed; bottom: 80px; left: 50%;
   transform: translateX(-50%) translateY(20px);
@@ -639,8 +663,9 @@ html, body {
   letter-spacing: 2px; padding: 10px 22px;
   z-index: 9999; opacity: 0;
   pointer-events: none;
-  transition: opacity 0.3s, transform 0.3s;
+  transition: opacity 0.2s, transform 0.2s;
   white-space: nowrap;
+  will-change: opacity, transform;
 }
 .toast.show {
   opacity: 1;
@@ -652,6 +677,7 @@ html, body {
   position: fixed; inset: 0; z-index: 9998;
   background: rgba(0,0,0,0.85);
   display: flex; align-items: center; justify-content: center;
+  /* PERF: backdrop-filter expensive on mobile — kept for desktop UX */
   backdrop-filter: blur(4px);
 }
 .modal-box {
@@ -680,7 +706,7 @@ html, body {
   border: 1px solid var(--cyan); color: var(--cyan);
   font-family: var(--font-display); font-size: 0.75rem;
   letter-spacing: 3px; cursor: pointer;
-  border-radius: var(--radius); transition: all 0.2s;
+  border-radius: var(--radius); transition: background 0.15s, box-shadow 0.15s;
 }
 .btn-modal-primary:hover {
   background: rgba(0,255,255,0.08);
@@ -692,7 +718,7 @@ html, body {
   border: 1px solid var(--border); color: var(--text-dim);
   font-family: var(--font-mono); font-size: 0.7rem;
   letter-spacing: 2px; cursor: pointer;
-  border-radius: var(--radius); transition: all 0.2s;
+  border-radius: var(--radius); transition: border-color 0.15s, color 0.15s;
 }
 .btn-modal-secondary:hover { border-color: var(--text-dim); color: var(--text); }
 
@@ -726,14 +752,21 @@ html, body {
   .ctrl-btn { padding: 10px 12px; min-width: 44px; }
 }
 
-/* ─── RGB BORDER ANIMATION ───────────────────────── */
+/* ─── RGB BORDER — PERF: will-change on animated elements ── */
+/* CHANGE: removed box-shadow from animation (triggers repaint every frame)
+   now only animates border-color which is cheaper */
 @keyframes rgbBorder {
-  0%   { border-color: rgba(0,255,255,0.4); box-shadow: 0 0 15px rgba(0,255,255,0.15); }
-  33%  { border-color: rgba(255,0,170,0.4); box-shadow: 0 0 15px rgba(255,0,170,0.15); }
-  66%  { border-color: rgba(0,255,136,0.4); box-shadow: 0 0 15px rgba(0,255,136,0.15); }
-  100% { border-color: rgba(0,255,255,0.4); box-shadow: 0 0 15px rgba(0,255,255,0.15); }
+  0%   { border-color: rgba(0,255,255,0.4); }
+  33%  { border-color: rgba(255,0,170,0.4); }
+  66%  { border-color: rgba(0,255,136,0.4); }
+  100% { border-color: rgba(0,255,255,0.4); }
 }
-.video-box.remote-box { animation: rgbBorder 4s linear infinite; }
+.video-box.remote-box {
+  animation: rgbBorder 4s linear infinite;
+  /* static glow instead of animated box-shadow (saves repaint) */
+  box-shadow: 0 0 12px rgba(0,255,255,0.12);
+  will-change: border-color;
+}
 
 /* ══════════════════════════════════════════════════
    NEW SCREENS & ROOM FEATURES
@@ -760,8 +793,10 @@ html, body {
   text-align: left;
   position: relative;
   overflow: hidden;
-  transition: border-color 0.25s, background 0.25s, transform 0.15s;
+  /* PERF: specific properties not 'all' */
+  transition: border-color 0.2s, background 0.2s, transform 0.15s, box-shadow 0.2s;
   width: 100%;
+  will-change: transform;
 }
 
 .mode-card::before {
@@ -807,7 +842,7 @@ html, body {
   letter-spacing: 0.08em;
   line-height: 1;
   margin-bottom: 4px;
-  transition: color 0.25s;
+  transition: color 0.2s;
 }
 
 .mode-desc {
@@ -822,7 +857,8 @@ html, body {
   font-size: 1.2rem;
   color: var(--text-dim);
   flex-shrink: 0;
-  transition: color 0.2s, transform 0.2s;
+  transition: color 0.15s, transform 0.15s;
+  will-change: transform;
 }
 
 .mode-card:hover .mode-arrow { color: var(--cyan); transform: translateX(4px); }
@@ -841,7 +877,7 @@ html, body {
   cursor: pointer;
   margin-bottom: 20px;
   align-self: flex-start;
-  transition: color 0.2s, border-color 0.2s;
+  transition: color 0.15s, border-color 0.15s;
 }
 .btn-back:hover { color: var(--cyan); border-color: var(--cyan); }
 
@@ -870,6 +906,7 @@ html, body {
   margin-bottom: 8px;
 }
 
+/* PERF: ridPulse now uses opacity (GPU) instead of text-shadow (CPU repaint) */
 .rid-value {
   font-family: var(--font-display);
   font-size: 2.4rem;
@@ -878,11 +915,11 @@ html, body {
   letter-spacing: 0.3em;
   text-shadow: 0 0 20px var(--cyan), 0 0 40px rgba(0,255,255,0.3);
   animation: ridPulse 2s ease-in-out infinite;
+  will-change: opacity;
 }
-
 @keyframes ridPulse {
-  0%, 100% { text-shadow: 0 0 20px var(--cyan), 0 0 40px rgba(0,255,255,0.3); }
-  50% { text-shadow: 0 0 30px var(--cyan), 0 0 60px rgba(0,255,255,0.5); }
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.7; }
 }
 
 .btn-copy-id {
@@ -895,7 +932,7 @@ html, body {
   padding: 4px 14px;
   border-radius: var(--radius);
   cursor: pointer;
-  transition: all 0.2s;
+  transition: border-color 0.15s, color 0.15s;
 }
 .btn-copy-id:hover { border-color: var(--cyan); color: var(--cyan); }
 
@@ -921,12 +958,14 @@ html, body {
   color: var(--text);
 }
 
+/* PERF: pillBlink uses opacity only — GPU composited */
 .pill-dot {
   width: 7px; height: 7px;
   border-radius: 50%;
   background: var(--green);
   box-shadow: 0 0 6px var(--green);
   animation: pillBlink 1.5s ease-in-out infinite;
+  will-change: opacity;
 }
 @keyframes pillBlink { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
@@ -944,21 +983,12 @@ html, body {
   gap: 6px;
   min-height: 0;
   overflow: hidden;
+  contain: layout paint;  /* PERF: isolate video panel repaints */
 }
 
-/* Layout: 2 people → side by side */
-.room-video-panel.layout-split {
-  flex-direction: row;
-}
-
-.room-video-panel.layout-split .video-box {
-  flex: 1;
-}
-
-/* Layout: 3+ people → big + strip */
-.room-video-panel.layout-multi {
-  flex-direction: column;
-}
+.room-video-panel.layout-split { flex-direction: row; }
+.room-video-panel.layout-split .video-box { flex: 1; }
+.room-video-panel.layout-multi { flex-direction: column; }
 
 .room-big-wrap {
   flex: 1;
@@ -968,7 +998,7 @@ html, body {
   overflow: hidden;
   border: 1px solid var(--border);
   min-height: 0;
-  transition: border-color 0.3s;
+  transition: border-color 0.2s;  /* PERF: specific, not 'all' */
 }
 
 .room-big-wrap.focused-remote {
@@ -1007,8 +1037,10 @@ html, body {
   border-radius: 6px;
   overflow: hidden;
   cursor: pointer;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  /* PERF: specific not 'all' */
+  transition: border-color 0.15s, box-shadow 0.15s;
   flex-shrink: 0;
+  contain: paint;
 }
 
 .room-thumb-item:hover {
@@ -1049,7 +1081,7 @@ html, body {
   flex-direction: column;
   gap: 3px;
   opacity: 0;
-  transition: opacity 0.2s;
+  transition: opacity 0.15s;
   pointer-events: none;
 }
 
@@ -1068,7 +1100,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 0.1s, border-color 0.1s;
   padding: 0;
 }
 
@@ -1086,7 +1118,7 @@ html, body {
   border-radius: 50%;
   background: #ff2244;
   box-shadow: 0 0 6px currentColor;
-  transition: background 0.3s;
+  transition: background 0.2s;
 }
 
 /* Remote muted/video-off state */
@@ -1098,14 +1130,12 @@ html, body {
 }
 .remote-video-off video { filter: brightness(0.1); }
 
-/* Room ID header display */
 #room-id-display {
   font-family: var(--font-display);
   letter-spacing: 0.2em;
   color: var(--cyan);
 }
 
-/* ─── Video panel room-ID in waiting ─────────── */
 .wait-count { margin-top: 10px; }
 
 /* ─── Responsive tweaks ──────────────────────── */
@@ -1116,4 +1146,7 @@ html, body {
   .rid-value  { font-size: 1.8rem; letter-spacing: 0.2em; }
   .room-strip { height: 90px; }
   .room-thumb-item { width: 100px; min-width: 100px; }
+
+  /* PERF: disable backdrop-filter on mobile (very expensive) */
+  .modal-overlay { backdrop-filter: none; background: rgba(0,0,0,0.92); }
 }
