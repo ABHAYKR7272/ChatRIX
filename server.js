@@ -10,27 +10,23 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 
-  // Faster dead-connection detection (was 60000/25000)
   pingTimeout:  20000,
   pingInterval:  8000,
 
-  // Prefer WebSocket, fall back to polling only if needed
   transports: ['websocket', 'polling'],
 
-  // Compress payloads → less bandwidth on slow connections
   httpCompression: true,
   perMessageDeflate: {
-    threshold: 256,         // compress anything > 256 bytes
-    zlibDeflateOptions: { level: 1 },  // fast compression (level 1 = best speed)
+    threshold: 256,
+    zlibDeflateOptions: { level: 1 },
   },
 
-  // Reject oversized payloads (prevents memory abuse with many users)
-  maxHttpBufferSize: 64 * 1024,  // 64 KB max per message
+  maxHttpBufferSize: 64 * 1024,
 });
 
 // ─── Static files with caching headers ───────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public'), {
-  maxAge: '1d',          // browsers cache JS/CSS for 1 day
+  maxAge: '1d',
   etag: true,
   lastModified: true,
 }));
@@ -48,8 +44,8 @@ const roomTimers = new Map();
 
 // Per-socket rate limiting: socketId → { count, resetAt }
 const msgRateMap = new Map();
-const MSG_RATE_LIMIT = 8;     // max messages per window
-const MSG_RATE_WINDOW = 2000; // per 2 seconds
+const MSG_RATE_LIMIT = 8;
+const MSG_RATE_WINDOW = 2000;
 
 function isRateLimited(socketId) {
   const now = Date.now();
@@ -149,6 +145,15 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     if (!room) { socket.emit('room_error', { msg: 'Room not found or expired' }); return; }
     if (room.password !== String(password).trim()) { socket.emit('room_error', { msg: 'Wrong password' }); return; }
+
+    // FIX: on rejoin, remove old stale entry with same name (disconnected socket)
+    // This allows the same person to rejoin without hitting the 6-member cap unfairly
+    const staleIdx = room.members.findIndex(m => m.name === safeName && !io.sockets.sockets.get(m.socketId));
+    if (staleIdx !== -1) {
+      console.log(`[ROOM] Removing stale member ${safeName} from ${roomId}`);
+      room.members.splice(staleIdx, 1);
+    }
+
     if (room.members.length >= 6) { socket.emit('room_error', { msg: 'Room is full (max 6)' }); return; }
 
     if (roomTimers.has(roomId)) {
@@ -164,7 +169,7 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('room_member_joined', {
       socketId: socket.id, name: safeName, members: room.members, sessionActive: room.started
     });
-    console.log(`[ROOM] ${safeName} joined ${roomId} | Members: ${room.members.length}`);
+    console.log(`[ROOM] ${safeName} joined ${roomId} | Members: ${room.members.length} | Started: ${room.started}`);
   });
 
   // ── Room: WebRTC mesh signaling ──
@@ -180,7 +185,7 @@ io.on('connection', (socket) => {
 
   // ── Room: Chat (rate-limited) ──
   socket.on('room_message', ({ roomId, text }) => {
-    if (isRateLimited(socket.id)) return;   // silently drop spam
+    if (isRateLimited(socket.id)) return;
     const name = userNames.get(socket.id) || 'User';
     if (text && String(text).trim().length > 0) {
       const safeText = String(text).trim().slice(0, 500);
