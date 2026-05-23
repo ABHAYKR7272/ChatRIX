@@ -46,6 +46,9 @@ let mySocketId       = null;
 let roomMuted        = false;
 let roomCamOff       = false;
 let isVideoSwapped   = false;  // double-click swap state
+let strangerFullscreen = null;  // null | 'big' | 'pip'
+let strangerRemoteAudioMuted = false;
+let strangerRemoteVideoHidden = false;
 
 // Room peer (only 1 peer in 2-person room)
 const roomPeers    = {};
@@ -250,6 +253,91 @@ async function startCall(initiator) {
     await peerConnection.setLocalDescription(offer);
     socket.emit('webrtc_offer', { offer });
   }
+}
+
+// ─── Stranger panel: double-tap fullscreen + overlay controls ────────────────
+function initStrangerPanel() {
+  strangerFullscreen = null;
+  strangerRemoteAudioMuted = false;
+  strangerRemoteVideoHidden = false;
+
+  const bigBox  = $('stranger-big-box');
+  const pipBox  = $('stranger-pip-box');
+  const panel   = $('video-panel-stranger');
+  const overlay = $('stranger-overlay');
+  const audioBtn = $('stranger-ctrl-audio');
+  const videoBtn = $('stranger-ctrl-video');
+
+  if (!bigBox || !pipBox || !panel) return;
+
+  // Double-tap/click on remote → fullscreen
+  addDoubleTapListener(bigBox, (e) => {
+    if (e.target && e.target.closest('.duo-ctrl-btn')) return;
+    toggleStrangerFullscreen('big');
+  });
+  // Double-tap/click on local → fullscreen
+  addDoubleTapListener(pipBox, () => toggleStrangerFullscreen('pip'));
+
+  // Overlay stop propagation
+  if (overlay) {
+    overlay.addEventListener('click', e => e.stopPropagation());
+    overlay.addEventListener('dblclick', e => e.stopPropagation());
+    overlay.addEventListener('touchend', e => e.stopPropagation());
+  }
+
+  if (audioBtn) {
+    audioBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleStrangerAudio(); });
+    audioBtn.addEventListener('touchend', (e) => e.stopPropagation());
+  }
+  if (videoBtn) {
+    videoBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleStrangerVideo(); });
+    videoBtn.addEventListener('touchend', (e) => e.stopPropagation());
+  }
+}
+
+function toggleStrangerFullscreen(panel) {
+  const panelEl = $('video-panel-stranger');
+  if (!panelEl) return;
+  if (strangerFullscreen === panel) {
+    panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+    strangerFullscreen = null;
+    showToast('↩ Back to split view');
+  } else {
+    panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+    panelEl.classList.add(panel === 'big' ? 'fullscreen-big' : 'fullscreen-pip');
+    strangerFullscreen = panel;
+    showToast(panel === 'big' ? '🔍 Stranger — fullscreen' : '🔍 Your video — fullscreen');
+  }
+}
+
+function toggleStrangerAudio() {
+  strangerRemoteAudioMuted = !strangerRemoteAudioMuted;
+  const vid = $('remoteVideo');
+  const btn = $('stranger-ctrl-audio');
+  if (vid) vid.muted = strangerRemoteAudioMuted;
+  if (btn) {
+    btn.classList.toggle('ctrl-active', strangerRemoteAudioMuted);
+    btn.title = strangerRemoteAudioMuted ? 'Unmute stranger audio' : 'Mute stranger audio';
+    btn.innerHTML = strangerRemoteAudioMuted
+      ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`
+      : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+  }
+  showToast(strangerRemoteAudioMuted ? '🔇 Stranger audio muted' : '🔊 Stranger audio on');
+}
+
+function toggleStrangerVideo() {
+  strangerRemoteVideoHidden = !strangerRemoteVideoHidden;
+  const vid = $('remoteVideo');
+  const btn = $('stranger-ctrl-video');
+  if (vid) vid.style.opacity = strangerRemoteVideoHidden ? '0' : '1';
+  if (btn) {
+    btn.classList.toggle('ctrl-active', strangerRemoteVideoHidden);
+    btn.title = strangerRemoteVideoHidden ? 'Show stranger video' : 'Hide stranger video';
+    btn.innerHTML = strangerRemoteVideoHidden
+      ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`
+      : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>`;
+  }
+  showToast(strangerRemoteVideoHidden ? '📷 Stranger video hidden' : '📷 Stranger video shown');
 }
 
 function closePeerConnection() {
@@ -680,8 +768,12 @@ function initSocket() {
 
   socket.on('matched', async ({ partnerName, initiator }) => {
     partnerNameDisplay.textContent = partnerName.toUpperCase();
+    // Update stranger panel label
+    const lbl = $('stranger-big-label');
+    if (lbl) lbl.textContent = partnerName.toUpperCase();
     clearMsgs(); addSys(`Connected to ${partnerName}. Say hello!`);
     showScreen('chat');
+    initStrangerPanel();
     await startCall(initiator);
   });
 
@@ -955,12 +1047,20 @@ function toggleCamera() {
 }
 function skipStranger() {
   closePeerConnection(); addSys('Searching for next stranger…');
+  strangerFullscreen = null; strangerRemoteAudioMuted = false; strangerRemoteVideoHidden = false;
+  const panelEl = $('video-panel-stranger');
+  if (panelEl) panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+  const remVid = $('remoteVideo');
+  if (remVid) remVid.style.opacity = '1';
   socket.emit('skip'); showScreen('waiting');
 }
 function endSession() {
   closePeerConnection(); stopLocalMedia();
   if (socket) { socket.removeAllListeners(); socket.disconnect(); socket = null; }
   isMuted = false; isCamOff = false;
+  strangerFullscreen = null; strangerRemoteAudioMuted = false; strangerRemoteVideoHidden = false;
+  const panelEl = $('video-panel-stranger');
+  if (panelEl) panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
   btnMute.classList.remove('active');
   btnMute.querySelector('.icon-unmuted').style.display = 'block';
   btnMute.querySelector('.icon-muted').style.display   = 'none';
