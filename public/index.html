@@ -131,6 +131,18 @@
       </div>
       <div class="input-hint">Share this with people you want to invite</div>
     </div>
+    <div class="input-group" style="margin-top:16px">
+      <label class="input-label">MAX MEMBERS</label>
+      <div class="member-count-selector">
+        <button class="member-count-btn" id="member-count-minus" aria-label="Decrease">−</button>
+        <div class="member-count-display">
+          <span class="member-count-value" id="member-count-value">2</span>
+          <span class="member-count-label">MEMBERS</span>
+        </div>
+        <button class="member-count-btn" id="member-count-plus" aria-label="Increase">+</button>
+      </div>
+      <div class="input-hint">Session auto-starts when all members join</div>
+    </div>
     <button class="btn-launch btn-create-room" id="btn-do-create-room">
       <span class="btn-text">⬡ CREATE ROOM</span>
       <span class="btn-glow"></span>
@@ -209,14 +221,16 @@
     <div class="lobby-members" id="lobby-members-list">
       <!-- member pills added dynamically -->
     </div>
-    <div class="wait-text" style="font-size:0.85rem; margin-top:8px">WAITING FOR MEMBERS TO JOIN</div>
+    <div class="lobby-status-line">
+      <span class="wait-count"><span id="lobby-member-count">1</span> / <span id="lobby-max-count">2</span></span>
+      <span class="lobby-status-text" id="lobby-status-text">WAITING FOR MEMBERS</span>
+    </div>
+    <div class="lobby-autostart-bar">
+      <div class="lobby-autostart-fill" id="lobby-autostart-fill"></div>
+    </div>
+    <div class="lobby-autostart-hint" id="lobby-autostart-hint">Session auto-starts when all members join</div>
     <div class="wait-dots"><span></span><span></span><span></span><span></span><span></span></div>
-    <div class="wait-count"><span id="lobby-member-count">1</span> / 6 members</div>
-    <button class="btn-launch" id="btn-start-room" style="margin-top:20px; padding: 12px 32px; font-size:0.9rem">
-      <span class="btn-text">▶ START SESSION</span>
-      <span class="btn-glow"></span>
-    </button>
-    <button class="btn-cancel" id="btn-cancel-room" style="margin-top:10px">LEAVE ROOM</button>
+    <button class="btn-cancel" id="btn-cancel-room" style="margin-top:18px">LEAVE ROOM</button>
   </div>
 </div>
 
