@@ -478,7 +478,6 @@ html, body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   min-height: 0;
-  aspect-ratio: 16/9;
   contain: paint;  /* PERF: video repaints stay inside the box */
 }
 .video-box video {
@@ -1314,59 +1313,50 @@ html, body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   DUO LAYOUT — 2-person room video (big + PiP)
+   DUO LAYOUT — 2-person room video
+   Default: HALF-HALF side by side
+   Double-click any panel → that panel goes FULLSCREEN
+   Double-click again → back to half-half
    ═══════════════════════════════════════════════════════════════════ */
 
 .layout-duo {
   position: relative;
   width: 100%;
   height: 100%;
+  display: flex;
+  flex-direction: row;
+  gap: 4px;
   background: #000;
-  border-radius: 8px;
   overflow: hidden;
 }
 
-/* Big video — takes full panel */
+/* Half-half default state */
 .duo-big {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  border-radius: 8px;
+  flex: 1;
+  position: relative;
   overflow: hidden;
   cursor: pointer;
-}
-
-.duo-big video {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-  transition: opacity 0.2s;
-}
-
-/* PiP — small corner box */
-.duo-pip {
-  position: absolute;
-  bottom: 12px;
-  right: 12px;
-  width: 140px;
-  height: 100px;
   border-radius: 6px;
+  transition: flex 0.35s cubic-bezier(0.4,0,0.2,1);
+  min-width: 0;
+}
+
+.duo-pip {
+  flex: 1;
+  position: relative;
   overflow: hidden;
-  border: 1.5px solid rgba(0,255,255,0.35);
-  box-shadow: 0 0 14px rgba(0,0,0,0.7), 0 0 8px rgba(0,255,255,0.15);
   cursor: pointer;
-  z-index: 10;
-  transition: transform 0.15s, box-shadow 0.15s;
-  background: #111;
+  border-radius: 6px;
+  border: 1.5px solid rgba(0,255,255,0.25);
+  transition: flex 0.35s cubic-bezier(0.4,0,0.2,1), border-color 0.2s;
+  min-width: 0;
 }
 
 .duo-pip:hover {
-  transform: scale(1.04);
-  box-shadow: 0 0 18px rgba(0,0,0,0.8), 0 0 12px rgba(0,255,255,0.3);
+  border-color: rgba(0,255,255,0.5);
 }
 
+.duo-big video,
 .duo-pip video {
   width: 100%;
   height: 100%;
@@ -1374,13 +1364,61 @@ html, body {
   display: block;
 }
 
+/* FULLSCREEN STATE: one panel expands to 100%, other collapses to 0 */
+.layout-duo.fullscreen-big .duo-big {
+  flex: 1 0 100%;
+  border-radius: 0;
+  z-index: 2;
+}
+.layout-duo.fullscreen-big .duo-pip {
+  flex: 0 0 0;
+  min-width: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.layout-duo.fullscreen-pip .duo-pip {
+  flex: 1 0 100%;
+  border-radius: 0;
+  z-index: 2;
+}
+.layout-duo.fullscreen-pip .duo-big {
+  flex: 0 0 0;
+  min-width: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Double-click hint */
+.duo-big::after,
+.duo-pip::after {
+  content: '⤡ double-click fullscreen';
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.58rem;
+  color: rgba(255,255,255,0.25);
+  letter-spacing: 0.08em;
+  pointer-events: none;
+  font-family: var(--font-mono), monospace;
+  white-space: nowrap;
+  transition: opacity 0.2s;
+}
+
+.layout-duo.fullscreen-big .duo-big::after,
+.layout-duo.fullscreen-pip .duo-pip::after {
+  content: '⤡ double-click to go back';
+  color: rgba(255,255,255,0.3);
+}
+
 /* Connection indicator */
 .conn-indicator {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  width: 9px;
-  height: 9px;
+  top: 8px;
+  left: 8px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: #ffaa00;
   box-shadow: 0 0 6px currentColor;
@@ -1388,69 +1426,51 @@ html, body {
   transition: background 0.3s;
 }
 
-/* Single-click overlay: audio + video controls */
+/* Partner overlay controls — always visible small icons top-right of partner panel */
 .duo-overlay {
   position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: 64px;
-  background: linear-gradient(transparent, rgba(0,0,0,0.75));
+  top: 8px;
+  right: 8px;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.2s ease;
+  flex-direction: row;
+  gap: 6px;
+  opacity: 0.85;
+  pointer-events: all;
   z-index: 8;
-  border-radius: 0 0 8px 8px;
 }
 
-.duo-overlay.visible {
-  opacity: 1;
-  pointer-events: all;
+.duo-overlay.hidden-overlay {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .duo-ctrl-btn {
-  background: rgba(0,0,0,0.6);
+  background: rgba(0,0,0,0.65);
   border: 1.5px solid rgba(0,255,255,0.4);
-  color: #fff;
-  border-radius: 50%;
-  width: 42px;
-  height: 42px;
+  color: rgba(255,255,255,0.9);
+  border-radius: 6px;
+  width: 32px;
+  height: 32px;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, transform 0.1s;
   outline: none;
-  backdrop-filter: blur(4px);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
 .duo-ctrl-btn:hover {
-  background: rgba(0,255,255,0.18);
+  background: rgba(0,255,255,0.2);
   border-color: var(--cyan);
-  transform: scale(1.08);
+  transform: scale(1.1);
 }
 
 .duo-ctrl-btn.ctrl-active {
-  background: rgba(255,0,80,0.25);
+  background: rgba(255,34,68,0.3);
   border-color: #ff2244;
   color: #ff2244;
-}
-
-/* Double-click hint on big video */
-.duo-big::after {
-  content: '⤡ double-click to swap';
-  position: absolute;
-  top: 10px;
-  right: 12px;
-  font-size: 0.6rem;
-  color: rgba(255,255,255,0.3);
-  letter-spacing: 0.08em;
-  pointer-events: none;
-  font-family: var(--font-mono), monospace;
 }
 
 /* Room wait screen hint text */
@@ -1463,7 +1483,7 @@ html, body {
   max-width: 280px;
 }
 
-/* Room info badge (2-person only label) */
+/* Room info badge */
 .room-info-badge {
   display: flex;
   align-items: center;
@@ -1481,3 +1501,104 @@ html, body {
 .room-info-icon {
   font-size: 1rem;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   WAITING SCREEN — PROFESSIONAL UPGRADE
+   ═══════════════════════════════════════════════════════════════════ */
+
+#screen-waiting,
+#screen-room-wait {
+  background:
+    radial-gradient(ellipse 70% 70% at 50% 30%, rgba(0,255,255,0.06) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 40% at 80% 80%, rgba(255,0,170,0.04) 0%, transparent 60%),
+    var(--bg);
+}
+
+.waiting-container {
+  max-width: 380px;
+  width: 100%;
+  padding: 0 20px;
+}
+
+.wait-logo {
+  font-size: 1.6rem;
+  letter-spacing: 8px;
+  margin-bottom: 8px;
+}
+
+/* Scanning animation text */
+.wait-text {
+  font-size: 0.85rem;
+  letter-spacing: 4px;
+  animation: textPulse 2s ease-in-out infinite;
+}
+
+@keyframes textPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* Animated searching bar (like talk to stranger) */
+.searching-bar-wrap {
+  width: 220px;
+  margin: 0 auto;
+}
+
+.searching-bar {
+  width: 100%;
+  height: 3px;
+  background: rgba(0,255,255,0.1);
+  border-radius: 2px;
+  overflow: hidden;
+  position: relative;
+}
+
+.searching-bar-fill {
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+  border-radius: 2px;
+  animation: searchSlide 1.8s ease-in-out infinite;
+}
+
+@keyframes searchSlide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+.wait-sub-text {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: rgba(0,255,255,0.4);
+  letter-spacing: 2px;
+  text-align: center;
+  margin-top: 6px;
+}
+
+/* User count - more prominent */
+.wait-count {
+  font-family: var(--font-display);
+  font-size: 0.85rem;
+  color: var(--cyan-dim);
+  letter-spacing: 3px;
+  margin-top: 0;
+}
+
+.wait-count strong {
+  color: var(--cyan);
+  font-size: 1.1rem;
+}
+
+/* ─── Lobby Screen Improvements ─────────────────── */
+#screen-room-lobby .waiting-container {
+  max-width: 400px;
+}
+
+.lobby-status-text {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 2px;
+  color: rgba(0,255,255,0.6);
+  animation: textPulse 2s ease-in-out infinite;
+}
+
