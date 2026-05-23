@@ -136,6 +136,9 @@ function showScreen(name) {
   const t = screens[name];
   t.style.display = 'flex';
   requestAnimationFrame(() => t.classList.add('active', 'fade-in'));
+  // FIX: pause heavy particle canvas when off landing (huge CPU win in calls)
+  const cv = document.getElementById('particleCanvas');
+  if (cv) cv.style.display = (name === 'landing') ? '' : 'none';
 }
 
 // ─── Toast ───────────────────────────────────────────────────────────────────
@@ -195,15 +198,19 @@ function showToast(msg, ms = 2800) {
 })();
 
 // ─── Media ───────────────────────────────────────────────────────────────────
+// FIX: peerCount >= 2 means mesh (room) mode — use small resolution by default
+// so joiners don't blast 720p to every other peer (saturates upload, kills 3+
+// connections, melts CPU). Pass 0 only for 1-to-1 stranger chat.
 async function getLocalMedia(peerCount = 0) {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-  const isMulti = peerCount > 1;
+  const isRoom  = peerCount >= 2;
+  const isHeavy = peerCount >= 3;
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width:     { ideal: isMulti ? 480  : 1280 },  // PERF: smaller in multi
-        height:    { ideal: isMulti ? 360  : 720  },
-        frameRate: { ideal: isMulti ? 15   : 30   },  // PERF: 15fps in multi
+        width:     { ideal: isHeavy ? 320 : isRoom ? 480 : 1280 },
+        height:    { ideal: isHeavy ? 240 : isRoom ? 360 : 720  },
+        frameRate: { ideal: isHeavy ? 12  : isRoom ? 15  : 30   },
         facingMode: 'user',
       },
       audio: {
@@ -211,7 +218,7 @@ async function getLocalMedia(peerCount = 0) {
         noiseSuppression: true,
         autoGainControl: true,
         sampleRate: 16000,
-        channelCount: 1,                               // PERF: mono saves bandwidth
+        channelCount: 1,
       },
     });
     localVideo.srcObject = localStream;
@@ -224,6 +231,27 @@ async function getLocalMedia(peerCount = 0) {
       localStream = null;
       showToast('⚠ No media — text only');
     }
+  }
+}
+
+// FIX: cap per-peer encoder bitrate so N outgoing streams don't saturate uplink
+async function capSenderBitrate(pc, peerCount) {
+  const isHeavy = peerCount >= 3;
+  const maxVideo = isHeavy ? 250_000 : 600_000;   // 250kbps / 600kbps
+  const maxAudio = 24_000;
+  for (const sender of pc.getSenders()) {
+    if (!sender.track) continue;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      params.encodings[0].maxBitrate =
+        sender.track.kind === 'video' ? maxVideo : maxAudio;
+      if (sender.track.kind === 'video') {
+        params.encodings[0].maxFramerate = isHeavy ? 12 : 15;
+        params.degradationPreference = 'maintain-framerate';
+      }
+      await sender.setParameters(params);
+    } catch (e) { /* not supported on some browsers — ignore */ }
   }
 }
 
@@ -308,6 +336,8 @@ async function createRoomPC(peerId) {
   roomPeers[peerId] = pc;
 
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  // FIX: cap encoder bitrate so mesh of 3+ peers doesn't saturate uplink
+  capSenderBitrate(pc, currentMaxMembers || roomMembers.length || 2);
 
   pc.ontrack = e => {
     if (!e.streams?.[0]) return;
@@ -1064,7 +1094,11 @@ async function startJoinRoomFlow() {
   if (roomId.length !== 6) { showToast('⚠ Enter a valid 6-digit room ID'); return; }
   if (!pass)               { showToast('⚠ Enter the room password'); return; }
   lastRoomPassword = pass;
-  await getLocalMedia();
+  myName = name;
+  // FIX: joiner doesn't know maxMembers yet — assume room mode (>=2) so we
+  // start with low-res capture. If room turns out to be 3+, we'll re-grab
+  // even smaller resolution inside room_joined/room_auto_start.
+  await getLocalMedia(2);
   initSocket();
   const go = () => { mySocketId = socket.id; socket.emit('join_room', { roomId, password: pass, name }); };
   socket.on('connect', go);
