@@ -66,6 +66,9 @@ const remoteVideoOff   = {};
 const pendingOffers = {};
 
 let rebuildTimer = null;
+let roomStartTimer = null;
+let roomSessionStarted = false;
+let roomSessionStarting = false;
 
 // ─── DOM shortcuts ───────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -626,9 +629,49 @@ function sendRoomMsg() {
 }
 
 // ─── Lobby ───────────────────────────────────────────────────────────────────
+function normalizeMaxMembers(members = roomMembers, maxMembers = currentMaxMembers) {
+  const memberCount = Array.isArray(members) ? members.length : 0;
+  const incoming = Number(maxMembers);
+  const current = Number(currentMaxMembers);
+  const selected = Number(selectedMaxMembers);
+  const candidates = [incoming, current, selected]
+    .filter(n => Number.isFinite(n) && n >= 2 && n <= 8);
+  let max = candidates.length ? Math.max(...candidates) : 2;
+
+  // If the server/client ever reports 3 members in a 2-person room, do not
+  // keep the lobby stuck at 3/2. Treat the visible members as the source of truth.
+  if (memberCount > max) max = memberCount;
+  return Math.max(2, Math.min(8, max));
+}
+
+function syncRoomState(members = roomMembers, maxMembers = currentMaxMembers) {
+  roomMembers = Array.isArray(members) ? members : [];
+  currentMaxMembers = normalizeMaxMembers(roomMembers, maxMembers);
+}
+
+function shouldAutoStartRoom() {
+  return !!currentRoomId
+    && Array.isArray(roomMembers)
+    && roomMembers.length >= normalizeMaxMembers(roomMembers, currentMaxMembers);
+}
+
+function scheduleRoomStart(isRejoin = false, delay = 500) {
+  if (!currentRoomId) return;
+  if (!isRejoin && (roomSessionStarted || roomSessionStarting)) return;
+  clearTimeout(roomStartTimer);
+  roomStartTimer = setTimeout(() => startRoomSession(isRejoin), delay);
+}
+
+async function prepareRoomMediaProfile() {
+  const peerCount = normalizeMaxMembers(roomMembers, currentMaxMembers);
+  await getLocalMedia(peerCount);
+  localStream?.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
+  localStream?.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
+}
+
 function updateLobby(members, maxMembers) {
-  roomMembers = members;
-  if (maxMembers !== undefined) currentMaxMembers = maxMembers;
+  syncRoomState(members, maxMembers);
+  members = roomMembers;
   const max = currentMaxMembers || 2;
 
   lobbyMemberCount.textContent = members.length;
@@ -637,7 +680,7 @@ function updateLobby(members, maxMembers) {
   const pct = Math.min(100, Math.round((members.length / max) * 100));
   if (lobbyAutostartFill) lobbyAutostartFill.style.width = pct + '%';
 
-  const remaining = max - members.length;
+  const remaining = Math.max(0, max - members.length);
   if (lobbyStatusText) {
     lobbyStatusText.textContent = remaining > 0
       ? `WAITING FOR ${remaining} MORE MEMBER${remaining !== 1 ? 'S' : ''}`
@@ -651,6 +694,8 @@ function updateLobby(members, maxMembers) {
     frag.appendChild(p);
   });
   lobbyMembersList.innerHTML = ''; lobbyMembersList.appendChild(frag);
+
+  if (shouldAutoStartRoom()) scheduleRoomStart(false, 650);
 }
 
 function updateMemberCount() {
@@ -745,22 +790,21 @@ function initSocket() {
 
   // ══ Room events ════════════════════════════════════════════════════════════
   socket.on('room_created', ({ roomId, name, members, maxMembers }) => {
-    currentRoomId = roomId; myName = name; roomMembers = members;
-    currentMaxMembers = maxMembers || 2;
-    lobbyRoomId.textContent = roomId; updateLobby(members, maxMembers);
+    currentRoomId = roomId; myName = name; syncRoomState(members, maxMembers);
+    roomSessionStarted = false; roomSessionStarting = false;
+    lobbyRoomId.textContent = roomId; updateLobby(roomMembers, currentMaxMembers);
     showScreen('roomLobby'); showToast(`✓ Room ${roomId} created!`);
   });
 
   socket.on('room_joined', ({ roomId, name, members, maxMembers, started }) => {
-    currentRoomId = roomId; myName = name; roomMembers = members;
-    currentMaxMembers = maxMembers || currentMaxMembers;
+    currentRoomId = roomId; myName = name; syncRoomState(members, maxMembers);
     mySocketId = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
       showToast('✓ Rejoined — reconnecting video…');
-      startRoomSession(true);
+      scheduleRoomStart(true, 100);
     } else {
-      updateLobby(members, maxMembers); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
+      updateLobby(roomMembers, currentMaxMembers); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
     }
   });
 
@@ -773,16 +817,20 @@ function initSocket() {
   });
 
   socket.on('room_auto_start', ({ members, maxMembers }) => {
-    roomMembers = members; currentMaxMembers = maxMembers;
-    updateLobby(members, maxMembers);
-    setTimeout(() => startRoomSession(false), 600); // slightly faster
+    syncRoomState(members, maxMembers);
+    updateLobby(roomMembers, currentMaxMembers);
+    scheduleRoomStart(false, 250);
   });
 
   socket.on('room_member_joined', ({ socketId, name, members, maxMembers, sessionActive }) => {
-    roomMembers = members; updateLobby(members, maxMembers); updateMemberCount();
+    syncRoomState(members, maxMembers); updateLobby(roomMembers, currentMaxMembers); updateMemberCount();
     roomSys(`${name} joined`); showToast(`🟢 ${name} joined`);
 
-    if (sessionActive && screens.roomChat.classList.contains('active')) {
+    if (sessionActive) {
+      if (!screens.roomChat.classList.contains('active')) {
+        scheduleRoomStart(true, 250);
+        return;
+      }
       scheduleLayout();
       // New member sends offers to us, we wait — glare prevention
       console.log(`[Room] member_joined(${socketId}) sessionActive — waiting for their offers`);
@@ -790,7 +838,7 @@ function initSocket() {
   });
 
   socket.on('room_member_left', ({ socketId, name, members }) => {
-    roomMembers = members; updateMemberCount();
+    syncRoomState(members, currentMaxMembers); updateMemberCount();
     roomSys(`${name} left`); showToast(`🔴 ${name} left`);
     if (roomPeers[socketId]) {
       const old = roomPeers[socketId];
@@ -923,14 +971,26 @@ function initSocket() {
 
 // ─── Start / rejoin room session ─────────────────────────────────────────────
 async function startRoomSession(isRejoin = false) {
-  if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
+  if (!currentRoomId) return;
+  if (!isRejoin && (roomSessionStarted || roomSessionStarting)) return;
+  if (isRejoin && roomSessionStarting) return;
 
-  if (isRejoin) {
-    closeAllRoomPeers();
-  }
+  clearTimeout(roomStartTimer);
+  roomStartTimer = null;
+  roomSessionStarting = true;
 
-  showScreen('roomChat');
-  buildLayout();
+  try {
+    if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
+
+    if (isRejoin) {
+      closeAllRoomPeers();
+    }
+
+    await prepareRoomMediaProfile();
+    roomSessionStarted = true;
+
+    showScreen('roomChat');
+    buildLayout();
   reassignStreams();
   roomSys(isRejoin ? 'Reconnecting video…' : 'Session started! Video connecting…');
 
@@ -964,6 +1024,9 @@ async function startRoomSession(isRejoin = false) {
       }, i * 100);
     }
   }
+  } finally {
+    roomSessionStarting = false;
+  }
 }
 
 // ─── Room cleanup ─────────────────────────────────────────────────────────────
@@ -974,6 +1037,10 @@ function cleanupRoom() {
   lastRoomPassword = '';
   roomMembers      = [];
   currentMaxMembers = 2;
+  clearTimeout(roomStartTimer);
+  roomStartTimer = null;
+  roomSessionStarted = false;
+  roomSessionStarting = false;
   focusedPeerId    = null;
   roomMuted        = false;
   roomCamOff       = false;
@@ -1080,7 +1147,7 @@ async function startCreateRoomFlow() {
   if (!pass) { showToast('⚠ Set a room password'); return; }
   lastRoomPassword = pass;
   currentMaxMembers = selectedMaxMembers;
-  await getLocalMedia(selectedMaxMembers > 2 ? selectedMaxMembers : 0);
+  await getLocalMedia(selectedMaxMembers);
   initSocket();
   const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass, maxMembers: selectedMaxMembers }); };
   socket.on('connect', go);
