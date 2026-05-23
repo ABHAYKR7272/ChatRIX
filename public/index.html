@@ -195,10 +195,14 @@
         <div class="radar-dot"></div>
       </div>
     </div>
-    <div class="wait-text">SCANNING FOR STRANGERS</div>
+    <div class="wait-text">SEARCHING FOR STRANGERS</div>
+    <div class="searching-bar-wrap">
+      <div class="searching-bar"><div class="searching-bar-fill"></div></div>
+      <div class="wait-sub-text">Looking for someone to connect with...</div>
+    </div>
     <div class="wait-dots"><span></span><span></span><span></span><span></span><span></span></div>
-    <div class="wait-count"><span id="online-count-wait">0</span> users in the matrix</div>
-    <button class="btn-cancel" id="btn-cancel-wait">ABORT MISSION</button>
+    <div class="wait-count"><strong id="online-count-wait">0</strong>&nbsp;users online</div>
+    <button class="btn-cancel" id="btn-cancel-wait">CANCEL</button>
   </div>
 </div>
 
@@ -238,7 +242,11 @@
         <div class="radar-dot"></div>
       </div>
     </div>
-    <div class="wait-text" id="room-wait-msg">Partner left. Waiting for them to rejoin…</div>
+    <div class="wait-text" id="room-wait-msg">PARTNER DISCONNECTED</div>
+    <div class="searching-bar-wrap">
+      <div class="searching-bar"><div class="searching-bar-fill"></div></div>
+      <div class="wait-sub-text" id="room-wait-sub">Waiting for them to reconnect...</div>
+    </div>
     <div class="wait-dots"><span></span><span></span><span></span><span></span><span></span></div>
     <div class="wait-hint">They can rejoin using the same Room ID and password</div>
     <button class="btn-cancel" id="btn-room-wait-leave" style="margin-top:24px">LEAVE ROOM</button>
