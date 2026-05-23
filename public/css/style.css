@@ -727,9 +727,11 @@ html, body {
 @media (max-width: 700px) {
   .chat-main { flex-direction: column; }
 
-  .video-panel {
-    flex: none;
-    height: 73vh; flex-direction: row;
+  .video-panel,
+  .room-video-panel {
+    flex: none !important;
+    height: 73vh !important;
+    flex-direction: row;
   }
 
   .msg-panel {
@@ -976,13 +978,13 @@ html, body {
 
 /* ─── Room Chat Screen ───────────────────────── */
 .room-video-panel {
-  flex: 1;
+  flex: 4.0;
   display: flex;
   position: relative;
   gap: 6px;
   min-height: 0;
   overflow: hidden;
-  contain: layout paint;  /* PERF: isolate video panel repaints */
+  contain: layout paint;
 }
 
 .room-video-panel.layout-split { flex-direction: row; }
@@ -1640,9 +1642,8 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 76vw !important;
+    height: 58vh !important;
     min-height: 220px;
-    max-height: 430px;
     flex-direction: row !important;
     padding: 4px;
   }
@@ -1728,8 +1729,8 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 71vw !important;
-    min-height: 265px;
+    height: 58vh !important;
+    min-height: 240px;
     padding: 5px;
   }
 
