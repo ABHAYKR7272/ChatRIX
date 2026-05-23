@@ -1150,3 +1150,114 @@ html, body {
   /* PERF: disable backdrop-filter on mobile (very expensive) */
   .modal-overlay { backdrop-filter: none; background: rgba(0,0,0,0.92); }
 }
+
+/* ─── Member Count Selector ─────────────────────────────────────── */
+.member-count-selector {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-top: 8px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid var(--cyan);
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 0 10px rgba(0,255,255,0.08);
+  width: fit-content;
+}
+
+.member-count-btn {
+  background: transparent;
+  border: none;
+  color: var(--cyan);
+  font-size: 1.4rem;
+  font-family: var(--font-display);
+  width: 48px;
+  height: 52px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: 0;
+  padding: 0;
+  outline: none;
+}
+.member-count-btn:hover:not(:disabled) {
+  background: rgba(0,255,255,0.12);
+  color: #fff;
+}
+.member-count-btn:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+.member-count-display {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 20px;
+  border-left: 1px solid rgba(0,255,255,0.2);
+  border-right: 1px solid rgba(0,255,255,0.2);
+  min-width: 72px;
+  height: 52px;
+}
+.member-count-value {
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  color: #fff;
+  line-height: 1;
+  letter-spacing: 0.04em;
+}
+.member-count-label {
+  font-size: 0.55rem;
+  color: var(--cyan);
+  letter-spacing: 0.2em;
+  margin-top: 2px;
+  opacity: 0.7;
+}
+
+/* ─── Lobby Auto-start Progress ─────────────────────────────────── */
+.lobby-status-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  justify-content: center;
+}
+.wait-count {
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+  color: var(--cyan);
+  letter-spacing: 0.1em;
+}
+.lobby-status-text {
+  font-size: 0.72rem;
+  color: rgba(255,255,255,0.5);
+  letter-spacing: 0.12em;
+}
+
+.lobby-autostart-bar {
+  margin: 12px auto 0;
+  width: 220px;
+  height: 3px;
+  background: rgba(0,255,255,0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.lobby-autostart-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--cyan);
+  border-radius: 2px;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 0 8px var(--cyan);
+}
+
+.lobby-autostart-hint {
+  font-size: 0.68rem;
+  color: rgba(0,255,255,0.45);
+  letter-spacing: 0.1em;
+  margin-top: 6px;
+  text-align: center;
+}
