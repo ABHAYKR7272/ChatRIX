@@ -345,6 +345,23 @@ async function createRoomPC(peerId) {
 // Single click on remote: show audio/video controls overlay
 // Double click on remote: swap — local becomes big, remote becomes small PiP
 
+// ─── Double-tap helper (works on both desktop dblclick and mobile touch) ──────
+function addDoubleTapListener(el, cb) {
+  // Desktop
+  el.addEventListener('dblclick', (e) => cb(e));
+  // Mobile touch — detect two taps within 300ms
+  let lastTap = 0;
+  el.addEventListener('touchend', (e) => {
+    const now = Date.now();
+    const gap = now - lastTap;
+    if (gap < 300 && gap > 30) {
+      e.preventDefault();
+      cb(e);
+    }
+    lastTap = now;
+  }, { passive: false });
+}
+
 // Track which panel is fullscreened: null | 'big' | 'pip'
 let fullscreenPanel = null;
 
@@ -396,23 +413,19 @@ function buildLayout() {
     `;
     bigBox.appendChild(overlay);
 
-    // Ctrl buttons (stop propagation so dblclick doesn't fire)
+    // Ctrl buttons — stop all events so double-tap doesn't fire fullscreen
     overlay.addEventListener('click', e => e.stopPropagation());
     overlay.addEventListener('dblclick', e => e.stopPropagation());
+    overlay.addEventListener('touchend', e => e.stopPropagation());
     overlay.querySelector('#duo-ctrl-audio').addEventListener('click', toggleDuoRemoteAudio);
     overlay.querySelector('#duo-ctrl-video').addEventListener('click', toggleDuoRemoteVideo);
+    overlay.querySelector('#duo-ctrl-audio').addEventListener('touchend', (e) => { e.stopPropagation(); });
+    overlay.querySelector('#duo-ctrl-video').addEventListener('touchend', (e) => { e.stopPropagation(); });
   }
 
-  // Double-click remote panel → fullscreen
-  let bigClickTimer = null;
-  bigBox.addEventListener('click', (e) => {
-    if (e.target.closest('.duo-ctrl-btn')) return;
-    clearTimeout(bigClickTimer);
-    bigClickTimer = setTimeout(() => {}, 250); // eat single click
-  });
-  bigBox.addEventListener('dblclick', (e) => {
-    if (e.target.closest('.duo-ctrl-btn')) return;
-    clearTimeout(bigClickTimer);
+  // Double-click / double-tap remote panel → fullscreen
+  addDoubleTapListener(bigBox, (e) => {
+    if (e.target && e.target.closest('.duo-ctrl-btn')) return;
     toggleFullscreen('big');
   });
 
@@ -430,16 +443,8 @@ function buildLayout() {
   const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
   pipBox.appendChild(pipLbl);
 
-  // Double-click local panel → fullscreen
-  let pipClickTimer = null;
-  pipBox.addEventListener('click', () => {
-    clearTimeout(pipClickTimer);
-    pipClickTimer = setTimeout(() => {}, 250);
-  });
-  pipBox.addEventListener('dblclick', () => {
-    clearTimeout(pipClickTimer);
-    toggleFullscreen('pip');
-  });
+  // Double-click / double-tap local panel → fullscreen
+  addDoubleTapListener(pipBox, () => toggleFullscreen('pip'));
 
   corners(pipBox);
   roomVideoPanel.appendChild(pipBox);
@@ -618,8 +623,10 @@ function updateLobby(members) {
 function showRoomWaitScreen(partnerName) {
   const msgEl = $('room-wait-msg');
   const subEl = $('room-wait-sub');
+  const ridEl = $('wait-room-id-display');
   if (msgEl) msgEl.textContent = 'PARTNER DISCONNECTED';
   if (subEl) subEl.textContent = `Waiting for ${partnerName} to reconnect...`;
+  if (ridEl && currentRoomId) ridEl.textContent = currentRoomId;
   showScreen('roomWait');
 }
 
