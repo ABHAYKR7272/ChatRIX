@@ -345,15 +345,19 @@ async function createRoomPC(peerId) {
 // Single click on remote: show audio/video controls overlay
 // Double click on remote: swap — local becomes big, remote becomes small PiP
 
+// Track which panel is fullscreened: null | 'big' | 'pip'
+let fullscreenPanel = null;
+
 function buildLayout() {
   roomVideoPanel.innerHTML = '';
   roomVideoPanel.className = 'video-panel room-video-panel layout-duo';
   isVideoSwapped = false;
+  fullscreenPanel = null;
 
   const others = roomMembers.filter(m => m.socketId !== mySocketId);
   const partner = others[0];
 
-  // Big video (remote by default)
+  // ── REMOTE panel (left / "big" by default) ──────────────────────
   const bigBox = el('div', 'video-box duo-big remote-box');
   bigBox.id = 'duo-big-box';
 
@@ -361,6 +365,7 @@ function buildLayout() {
   Object.assign(bigVid, { id: 'duo-big-vid', autoplay: true, playsInline: true, muted: false });
   bigBox.appendChild(bigVid);
 
+  // Partner label
   if (partner) {
     const lbl = el('div', 'video-label remote-label');
     lbl.id = 'duo-big-label';
@@ -368,21 +373,22 @@ function buildLayout() {
     bigBox.appendChild(lbl);
   }
 
+  // Connection indicator dot
   const ind = el('div', 'conn-indicator'); ind.id = 'conn-indicator-main'; bigBox.appendChild(ind);
   corners(bigBox);
 
-  // Single-click overlay controls (audio + video icons)
+  // Partner controls overlay (always visible small icons, top-right)
   if (partner) {
     const overlay = el('div', 'duo-overlay'); overlay.id = 'duo-overlay';
     overlay.innerHTML = `
-      <button class="duo-ctrl-btn" id="duo-ctrl-audio" title="Mute/Unmute audio">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="duo-ctrl-btn" id="duo-ctrl-audio" title="Mute partner audio">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
           <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
         </svg>
       </button>
-      <button class="duo-ctrl-btn" id="duo-ctrl-video" title="Show/Hide video">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="duo-ctrl-btn" id="duo-ctrl-video" title="Hide partner video">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <polygon points="23 7 16 12 23 17 23 7"></polygon>
           <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
         </svg>
@@ -390,54 +396,74 @@ function buildLayout() {
     `;
     bigBox.appendChild(overlay);
 
-    // Single click → show/hide controls
-    let clickTimer = null;
-    bigBox.addEventListener('click', (e) => {
-      if (e.target.closest('.duo-ctrl-btn')) return;
-      clearTimeout(clickTimer);
-      clickTimer = setTimeout(() => {
-        overlay.classList.toggle('visible');
-      }, 220);
-    });
-
-    // Double click → swap big/small
-    bigBox.addEventListener('dblclick', (e) => {
-      clearTimeout(clickTimer);
-      swapVideos();
-    });
-
-    // Ctrl buttons
-    $('duo-ctrl-audio') && $('duo-ctrl-audio').addEventListener('click', e => {
-      e.stopPropagation();
-      toggleDuoRemoteAudio();
-    });
-    $('duo-ctrl-video') && $('duo-ctrl-video').addEventListener('click', e => {
-      e.stopPropagation();
-      toggleDuoRemoteVideo();
-    });
+    // Ctrl buttons (stop propagation so dblclick doesn't fire)
+    overlay.addEventListener('click', e => e.stopPropagation());
+    overlay.addEventListener('dblclick', e => e.stopPropagation());
+    overlay.querySelector('#duo-ctrl-audio').addEventListener('click', toggleDuoRemoteAudio);
+    overlay.querySelector('#duo-ctrl-video').addEventListener('click', toggleDuoRemoteVideo);
   }
+
+  // Double-click remote panel → fullscreen
+  let bigClickTimer = null;
+  bigBox.addEventListener('click', (e) => {
+    if (e.target.closest('.duo-ctrl-btn')) return;
+    clearTimeout(bigClickTimer);
+    bigClickTimer = setTimeout(() => {}, 250); // eat single click
+  });
+  bigBox.addEventListener('dblclick', (e) => {
+    if (e.target.closest('.duo-ctrl-btn')) return;
+    clearTimeout(bigClickTimer);
+    toggleFullscreen('big');
+  });
 
   roomVideoPanel.appendChild(bigBox);
 
-  // Small PiP (local)
+  // ── LOCAL panel (right / "pip" by default) ──────────────────────
   const pipBox = el('div', 'video-box duo-pip local-box');
   pipBox.id = 'duo-pip-box';
+
   const pipVid = el('video');
   Object.assign(pipVid, { id: 'duo-pip-vid', autoplay: true, playsInline: true, muted: true });
   if (localStream) pipVid.srcObject = localStream;
   pipBox.appendChild(pipVid);
+
   const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
   pipBox.appendChild(pipLbl);
 
-  // Double click on PiP also swaps
-  pipBox.addEventListener('dblclick', swapVideos);
+  // Double-click local panel → fullscreen
+  let pipClickTimer = null;
+  pipBox.addEventListener('click', () => {
+    clearTimeout(pipClickTimer);
+    pipClickTimer = setTimeout(() => {}, 250);
+  });
+  pipBox.addEventListener('dblclick', () => {
+    clearTimeout(pipClickTimer);
+    toggleFullscreen('pip');
+  });
 
   corners(pipBox);
   roomVideoPanel.appendChild(pipBox);
 
-  // Attach remote stream if already have it
+  // Attach remote stream if already available
   if (partner && roomStreams[partner.socketId]) {
     attachRemoteStream(partner.socketId, roomStreams[partner.socketId]);
+  }
+}
+
+// Toggle a panel to fullscreen / back to half-half
+function toggleFullscreen(panel) {
+  const layoutEl = roomVideoPanel;
+  if (fullscreenPanel === panel) {
+    // Already fullscreen → go back to half-half
+    layoutEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+    fullscreenPanel = null;
+    showToast('↩ Back to split view');
+  } else {
+    // Enter fullscreen
+    layoutEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+    layoutEl.classList.add(panel === 'big' ? 'fullscreen-big' : 'fullscreen-pip');
+    fullscreenPanel = panel;
+    showToast(panel === 'big' ? '🔍 Partner — fullscreen' : '🔍 Your video — fullscreen');
   }
 }
 
@@ -451,75 +477,40 @@ function toggleDuoRemoteAudio() {
   if (vid) vid.muted = duoRemoteAudioMuted;
   if (btn) {
     btn.classList.toggle('ctrl-active', duoRemoteAudioMuted);
-    btn.title = duoRemoteAudioMuted ? 'Unmute audio' : 'Mute audio';
+    btn.title = duoRemoteAudioMuted ? 'Unmute partner audio' : 'Mute partner audio';
     btn.innerHTML = duoRemoteAudioMuted
-      ? `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`
-      : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+      ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`
+      : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
   }
-  showToast(duoRemoteAudioMuted ? '🔇 Audio muted locally' : '🔊 Audio on');
+  showToast(duoRemoteAudioMuted ? '🔇 Partner audio muted' : '🔊 Partner audio on');
 }
 
 function toggleDuoRemoteVideo() {
   duoRemoteVideoHidden = !duoRemoteVideoHidden;
   const vid = $('duo-big-vid');
   const btn = $('duo-ctrl-video');
-  if (vid) vid.style.opacity = duoRemoteVideoHidden ? '0' : '1';
+  if (vid) { vid.style.opacity = duoRemoteVideoHidden ? '0' : '1'; }
   if (btn) {
     btn.classList.toggle('ctrl-active', duoRemoteVideoHidden);
-    btn.title = duoRemoteVideoHidden ? 'Show video' : 'Hide video';
+    btn.title = duoRemoteVideoHidden ? 'Show partner video' : 'Hide partner video';
+    btn.innerHTML = duoRemoteVideoHidden
+      ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`
+      : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>`;
   }
-  showToast(duoRemoteVideoHidden ? '📷 Video hidden locally' : '📷 Video shown');
+  showToast(duoRemoteVideoHidden ? '📷 Partner video hidden' : '📷 Partner video shown');
 }
 
 function swapVideos() {
+  // Legacy compat — just toggle fullscreen of the swapped state
   isVideoSwapped = !isVideoSwapped;
-  const bigBox = $('duo-big-box');
-  const pipBox = $('duo-pip-box');
-  const bigVid = $('duo-big-vid');
-  const pipVid = $('duo-pip-vid');
-  const bigLbl = $('duo-big-label');
-  const pipLbl = $('duo-pip-label');
-
-  if (!bigBox || !pipBox) return;
-
-  const others  = roomMembers.filter(m => m.socketId !== mySocketId);
-  const partner = others[0];
-
-  if (isVideoSwapped) {
-    // LOCAL is big, REMOTE is PiP
-    bigBox.classList.add('local-box'); bigBox.classList.remove('remote-box');
-    pipBox.classList.add('remote-box'); pipBox.classList.remove('local-box');
-    if (bigVid) { bigVid.srcObject = localStream; bigVid.muted = true; }
-    if (pipVid && partner && roomStreams[partner.socketId]) {
-      pipVid.srcObject = roomStreams[partner.socketId]; pipVid.muted = duoRemoteAudioMuted;
-    }
-    if (bigLbl) bigLbl.textContent = 'YOU';
-    if (pipLbl) pipLbl.textContent = partner ? partner.name.toUpperCase() : 'PARTNER';
-    showToast('📺 Your video is now full-screen — double-click to switch back');
-  } else {
-    // REMOTE is big, LOCAL is PiP (default)
-    bigBox.classList.add('remote-box'); bigBox.classList.remove('local-box');
-    pipBox.classList.add('local-box'); pipBox.classList.remove('remote-box');
-    if (bigVid && partner && roomStreams[partner.socketId]) {
-      bigVid.srcObject = roomStreams[partner.socketId]; bigVid.muted = duoRemoteAudioMuted;
-    }
-    if (pipVid) { pipVid.srcObject = localStream; pipVid.muted = true; }
-    if (bigLbl) bigLbl.textContent = partner ? partner.name.toUpperCase() : 'PARTNER';
-    if (pipLbl) pipLbl.textContent = 'YOU';
-    showToast('📺 Switched back to normal view');
-  }
+  showToast(isVideoSwapped ? '↔ Swapped views' : '↔ Back to default');
 }
 
 function attachRemoteStream(peerId, stream) {
   roomStreams[peerId] = stream;
-  // In duo layout, always attach to the remote-targeted video
-  if (!isVideoSwapped) {
-    const v = $('duo-big-vid');
-    if (v) { v.srcObject = stream; v.muted = duoRemoteAudioMuted; v.play().catch(() => {}); }
-  } else {
-    const v = $('duo-pip-vid');
-    if (v) { v.srcObject = stream; v.muted = duoRemoteAudioMuted; v.play().catch(() => {}); }
-  }
+  // Always attach remote to duo-big-vid (left panel = partner)
+  const v = $('duo-big-vid');
+  if (v) { v.srcObject = stream; v.muted = duoRemoteAudioMuted; v.play().catch(() => {}); }
 }
 
 function updateConnIndicator(iceState) {
@@ -626,7 +617,9 @@ function updateLobby(members) {
 // ─── Room Wait Screen (waiting for partner to rejoin) ────────────────────────
 function showRoomWaitScreen(partnerName) {
   const msgEl = $('room-wait-msg');
-  if (msgEl) msgEl.textContent = `${partnerName} left the call. Waiting for them to rejoin…`;
+  const subEl = $('room-wait-sub');
+  if (msgEl) msgEl.textContent = 'PARTNER DISCONNECTED';
+  if (subEl) subEl.textContent = `Waiting for ${partnerName} to reconnect...`;
   showScreen('roomWait');
 }
 
