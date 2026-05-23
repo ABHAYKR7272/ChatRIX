@@ -272,15 +272,32 @@
     </header>
 
     <div class="chat-main">
-      <div class="video-panel" id="video-panel-stranger">
-        <div class="video-box remote-box">
+      <div class="video-panel layout-duo" id="video-panel-stranger">
+        <!-- Remote (Stranger) panel -->
+        <div class="video-box duo-big remote-box" id="stranger-big-box">
           <video id="remoteVideo" autoplay playsinline></video>
-          <div class="video-label remote-label">STRANGER</div>
+          <div class="video-label remote-label" id="stranger-big-label">STRANGER</div>
           <div class="video-overlay-text" id="remote-status">Connecting...</div>
+          <!-- Stranger overlay: mute speaker + hide video -->
+          <div class="duo-overlay" id="stranger-overlay">
+            <button class="duo-ctrl-btn" id="stranger-ctrl-audio" title="Mute stranger audio">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+              </svg>
+            </button>
+            <button class="duo-ctrl-btn" id="stranger-ctrl-video" title="Hide stranger video">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polygon points="23 7 16 12 23 17 23 7"></polygon>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+              </svg>
+            </button>
+          </div>
           <div class="video-corner tl"></div><div class="video-corner tr"></div>
           <div class="video-corner bl"></div><div class="video-corner br"></div>
         </div>
-        <div class="video-box local-box">
+        <!-- Local (You) panel -->
+        <div class="video-box duo-pip local-box" id="stranger-pip-box">
           <video id="localVideo" autoplay playsinline muted></video>
           <div class="video-label local-label">YOU</div>
           <div class="video-corner tl"></div><div class="video-corner tr"></div>
