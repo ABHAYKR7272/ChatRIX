@@ -1,56 +1,69 @@
-/* ═══════════════════════════════════════════════════════
-   CHAT-RIX  —  app.js
-   FIX: ghost socket, signalingState guards, ICE queue,
-        rejoin glare, per-peer lock, stable-state check
-   ═══════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+   CHAT-RIX  —  app.js  (complete rewrite — WebRTC reliability patch)
+   ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
+// ─── ICE / TURN config ───────────────────────────────────────────────────────
 const ICE_CFG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    {
+      urls:       'turn:openrelay.metered.ca:80',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls:       'turn:openrelay.metered.ca:443',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls:       'turn:openrelay.metered.ca:443?transport=tcp',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
-  iceCandidatePoolSize: 6,
-  bundlePolicy: 'max-bundle',
+  iceCandidatePoolSize: 8,
+  bundlePolicy:  'max-bundle',
   rtcpMuxPolicy: 'require',
 };
 
-// ─── Global state ─────────────────────────────────────
-let socket            = null;
-let localStream       = null;
-let peerConnection    = null;   // stranger mode
-let myName            = '';
-let isMuted           = false;
-let isCamOff          = false;
+// ─── Global state ────────────────────────────────────────────────────────────
+let socket         = null;
+let localStream    = null;
+let peerConnection = null;   // stranger-mode only
+let myName         = '';
+let isMuted        = false;
+let isCamOff       = false;
 
 // Room state
 let currentRoomId    = null;
 let lastRoomPassword = '';
-let roomPeers        = {};      // peerId → RTCPeerConnection
-let roomStreams       = {};      // peerId → MediaStream
-let silenceState     = {};
 let roomMembers      = [];
 let mySocketId       = null;
 let focusedPeerId    = null;
 let roomMuted        = false;
 let roomCamOff       = false;
-let remoteAudioMuted = {};
-let remoteVideoOff   = {};
 
-// Per-peer signaling lock: prevents concurrent offer/answer on same peer
-// peerId → 'offering' | 'answering' | null
-const peerLock = {};
-
-// ICE candidate queue: holds candidates that arrive before remote desc is set
-// peerId → RTCIceCandidateInit[]
-const iceQueue = {};
+// roomPeers[peerId]  → RTCPeerConnection
+// roomStreams[peerId] → MediaStream
+// iceQueue[peerId]   → RTCIceCandidateInit[]  (buffered before remoteDesc set)
+// peerState[peerId]  → 'idle'|'offering'|'answering'  (glare guard)
+// offerRetries[peerId] → number   (ICE-failed re-offer counter)
+const roomPeers    = {};
+const roomStreams   = {};
+const iceQueue     = {};
+const peerState    = {};
+const offerRetries = {};
+const silenceState     = {};
+const remoteAudioMuted = {};
+const remoteVideoOff   = {};
 
 let rebuildTimer = null;
 
-// ─── DOM shortcuts ────────────────────────────────────
+// ─── DOM shortcuts ───────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
 const screens = {
@@ -105,15 +118,18 @@ const btnRoomMute        = $('btn-room-mute');
 const btnRoomCam         = $('btn-room-cam');
 const btnRoomLeave       = $('btn-room-leave');
 
-// ─── Screen ───────────────────────────────────────────
+// ─── Screen ──────────────────────────────────────────────────────────────────
 function showScreen(name) {
-  Object.values(screens).forEach(el => { el.classList.remove('active','fade-in'); el.style.display = 'none'; });
+  Object.values(screens).forEach(el => {
+    el.classList.remove('active', 'fade-in');
+    el.style.display = 'none';
+  });
   const t = screens[name];
   t.style.display = 'flex';
-  requestAnimationFrame(() => t.classList.add('active','fade-in'));
+  requestAnimationFrame(() => t.classList.add('active', 'fade-in'));
 }
 
-// ─── Toast ────────────────────────────────────────────
+// ─── Toast ───────────────────────────────────────────────────────────────────
 let toastTmr = null;
 function showToast(msg, ms = 2800) {
   toastEl.textContent = msg;
@@ -122,16 +138,19 @@ function showToast(msg, ms = 2800) {
   toastTmr = setTimeout(() => toastEl.classList.remove('show'), ms);
 }
 
-// ─── Particles ────────────────────────────────────────
+// ─── Particles ───────────────────────────────────────────────────────────────
 (function () {
   const cv = $('particleCanvas'); if (!cv) return;
   const cx = cv.getContext('2d');
   const N = 40, D = 80, CLR = ['#00ffff','#ff00aa','#00ff88','#fff'];
   let W, H, pts = [], run = true, raf = null;
   const resize = () => { W = cv.width = innerWidth; H = cv.height = innerHeight; };
-  const rp = () => ({ x:Math.random()*W, y:Math.random()*H, r:Math.random()*1.2+.3,
+  const rp = () => ({
+    x:Math.random()*W, y:Math.random()*H,
+    r:Math.random()*1.2+.3,
     dx:(Math.random()-.5)*.35, dy:(Math.random()-.5)*.35,
-    c:CLR[0|Math.random()*4], a:Math.random()*.4+.1 });
+    c:CLR[0|Math.random()*4], a:Math.random()*.4+.1,
+  });
   function draw() {
     if (!run) { raf = null; return; }
     raf = requestAnimationFrame(draw);
@@ -153,28 +172,37 @@ function showToast(msg, ms = 2800) {
       }
     }
   }
-  document.addEventListener('visibilitychange', () => { if(document.hidden){run=false;}else{run=true;if(!raf)draw();} });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { run=false; } else { run=true; if(!raf) draw(); }
+  });
   addEventListener('resize', resize);
   resize(); pts = Array.from({length:N},rp); draw();
 })();
 
-// ─── Media ────────────────────────────────────────────
+// ─── Media ───────────────────────────────────────────────────────────────────
 async function getLocalMedia(peerCount = 0) {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   const isMulti = peerCount > 1;
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width:{ideal:isMulti?640:1280}, height:{ideal:isMulti?480:720},
-               frameRate:{ideal:isMulti?20:30}, facingMode:'user' },
-      audio: { echoCancellation:true, noiseSuppression:true, sampleRate:16000 }
+      video: {
+        width:     { ideal: isMulti ? 640  : 1280 },
+        height:    { ideal: isMulti ? 480  : 720  },
+        frameRate: { ideal: isMulti ? 20   : 30   },
+        facingMode: 'user',
+      },
+      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
     });
     localVideo.srcObject = localStream;
   } catch {
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localVideo.srcObject = null;
       showToast('⚠ Camera unavailable — audio only');
-    } catch { localStream = null; showToast('⚠ No media — text only'); }
+    } catch {
+      localStream = null;
+      showToast('⚠ No media — text only');
+    }
   }
 }
 
@@ -183,21 +211,26 @@ function stopLocalMedia() {
   localVideo.srcObject = null;
 }
 
-// ─── WebRTC: Stranger ────────────────────────────────
+// ─── WebRTC: Stranger ────────────────────────────────────────────────────────
 function createPeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
   const pc = new RTCPeerConnection(ICE_CFG);
   peerConnection = pc;
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
   pc.ontrack = e => {
-    if (e.streams?.[0]) { remoteVideo.srcObject = e.streams[0]; remoteStatus.classList.add('hidden'); }
+    if (e.streams?.[0]) {
+      remoteVideo.srcObject = e.streams[0];
+      remoteStatus.classList.add('hidden');
+    }
   };
   pc.onicecandidate = e => { if (e.candidate) socket.emit('webrtc_ice', { candidate: e.candidate }); };
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
+    console.log('[Stranger] connectionState:', s);
     if (s === 'connected') remoteStatus.classList.add('hidden');
     else if (s === 'failed' || s === 'disconnected') {
-      remoteStatus.textContent = 'Connection lost...'; remoteStatus.classList.remove('hidden');
+      remoteStatus.textContent = 'Connection lost…';
+      remoteStatus.classList.remove('hidden');
     }
   };
   return pc;
@@ -206,7 +239,7 @@ function createPeerConnection() {
 async function startCall(initiator) {
   createPeerConnection();
   if (initiator) {
-    const offer = await peerConnection.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true });
+    const offer = await peerConnection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await peerConnection.setLocalDescription(offer);
     socket.emit('webrtc_offer', { offer });
   }
@@ -215,122 +248,189 @@ async function startCall(initiator) {
 function closePeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
   remoteVideo.srcObject = null;
-  remoteStatus.textContent = 'Connecting...'; remoteStatus.classList.remove('hidden');
+  remoteStatus.textContent = 'Connecting…';
+  remoteStatus.classList.remove('hidden');
 }
 
-// ─── ICE queue helpers ────────────────────────────────
+// ─── ICE queue helpers ───────────────────────────────────────────────────────
 function enqueueIce(peerId, candidate) {
   if (!iceQueue[peerId]) iceQueue[peerId] = [];
   iceQueue[peerId].push(candidate);
+  console.log(`[ICE] queued for ${peerId} (total=${iceQueue[peerId].length})`);
 }
 
 async function flushIceQueue(peerId) {
-  const q = iceQueue[peerId] || []; delete iceQueue[peerId];
-  const pc = roomPeers[peerId]; if (!pc) return;
+  const q = iceQueue[peerId] || [];
+  delete iceQueue[peerId];
+  if (!q.length) return;
+  const pc = roomPeers[peerId];
+  if (!pc || !pc.remoteDescription?.type) return;
+  console.log(`[ICE] flushing ${q.length} queued candidates for ${peerId}`);
   for (const c of q) {
     try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
-    catch (e) { console.warn('[ICE queue flush]', e.message); }
+    catch (e) { console.warn('[ICE] flush error:', e.message); }
   }
 }
 
-// ─── WebRTC: Room ─────────────────────────────────────
+// ─── Peer connection lifecycle ───────────────────────────────────────────────
+/**
+ * Destroy the existing RTCPeerConnection for a peer completely,
+ * then create a fresh one with all handlers attached.
+ */
 async function createRoomPC(peerId) {
-  // Tear down any existing connection for this peer cleanly
+  // Tear down existing PC cleanly
   if (roomPeers[peerId]) {
-    roomPeers[peerId].onicecandidate = null;
-    roomPeers[peerId].ontrack        = null;
-    roomPeers[peerId].onconnectionstatechange = null;
-    roomPeers[peerId].oniceconnectionstatechange = null;
-    roomPeers[peerId].close();
+    const old = roomPeers[peerId];
+    old.onicecandidate           = null;
+    old.ontrack                  = null;
+    old.onconnectionstatechange  = null;
+    old.oniceconnectionstatechange = null;
+    old.onnegotiationneeded      = null;
+    try { old.close(); } catch {}
     delete roomPeers[peerId];
   }
   delete iceQueue[peerId];
-  delete peerLock[peerId];
 
   const pc = new RTCPeerConnection(ICE_CFG);
   roomPeers[peerId] = pc;
 
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
+  // ── Remote track → attach to video element ────────────────────────────────
   pc.ontrack = e => {
     if (!e.streams?.[0]) return;
-    roomStreams[peerId] = e.streams[0];
-    const vid = $(`rv-${peerId}`);
-    if (vid) vid.srcObject = e.streams[0];
-    if (focusedPeerId === peerId) {
-      const bv = $('room-big-video');
-      if (bv) { bv.srcObject = e.streams[0]; bv.muted = false; }
+    const stream = e.streams[0];
+    roomStreams[peerId] = stream;
+    console.log(`[Room] ontrack from ${peerId}`);
+    attachStream(peerId, stream);
+  };
+
+  // ── ICE gathering ─────────────────────────────────────────────────────────
+  pc.onicecandidate = e => {
+    if (e.candidate) {
+      socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
     }
   };
 
-  pc.onicecandidate = e => {
-    if (e.candidate) socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
-  };
-
+  // ── ICE connection state ──────────────────────────────────────────────────
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
-    const dot = $(`ri-${peerId}`);
-    if (dot) dot.style.background =
-      (s === 'connected' || s === 'completed') ? '#00ff88' :
-      s === 'checking' ? '#ffaa00' : '#ff2244';
+    console.log(`[Room] iceConnectionState ${peerId}: ${s}`);
+    setIndicator(peerId, s);
 
     if (s === 'failed') {
-      console.warn(`[Room] ICE failed → ${peerId}: restartIce`);
+      console.warn(`[Room] ICE failed for ${peerId} — attempting restartIce`);
       try { pc.restartIce(); } catch {}
     }
   };
 
+  // ── Overall connection state ───────────────────────────────────────────────
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') {
-      console.warn(`[Room] Connection failed → ${peerId}: re-offer in 1.5 s`);
-      setTimeout(() => { if (roomPeers[peerId] === pc) initiateOffer(peerId); }, 1500);
+    const s = pc.connectionState;
+    console.log(`[Room] connectionState ${peerId}: ${s}`);
+
+    if (s === 'connected') {
+      offerRetries[peerId] = 0;
+      // Re-attach stream in case the video element was rebuilt during layout
+      if (roomStreams[peerId]) attachStream(peerId, roomStreams[peerId]);
+    }
+
+    if (s === 'failed') {
+      const retries = (offerRetries[peerId] || 0);
+      if (retries < 3) {
+        offerRetries[peerId] = retries + 1;
+        console.warn(`[Room] Connection failed for ${peerId} — re-offer attempt ${offerRetries[peerId]}`);
+        setTimeout(() => {
+          // Only re-offer if the PC is still the one we created (not replaced)
+          if (roomPeers[peerId] === pc) {
+            peerState[peerId] = 'idle';
+            initiateOffer(peerId);
+          }
+        }, 2000 + retries * 1000);
+      } else {
+        console.error(`[Room] Connection permanently failed for ${peerId} after ${retries} retries`);
+        showToast('⚠ Peer connection failed — try re-joining');
+      }
     }
   };
 
+  console.log(`[Room] PC created for ${peerId}`);
   return pc;
 }
 
-// Initiate an offer to a peer — with lock to prevent concurrent signaling
+/**
+ * Attach a MediaStream to all video elements for a given peer.
+ * Handles both split-layout (rv-peerId) and thumbnail (same id) cases.
+ */
+function attachStream(peerId, stream) {
+  const vid = $(`rv-${peerId}`);
+  if (vid) {
+    vid.srcObject = stream;
+    vid.play().catch(() => {});
+    console.log(`[Room] stream attached to rv-${peerId}`);
+  }
+  // Big-view slot if this peer is focused
+  if (focusedPeerId === peerId) {
+    const bv = $('room-big-video');
+    if (bv) { bv.srcObject = stream; bv.muted = false; bv.play().catch(() => {}); }
+  }
+}
+
+function setIndicator(peerId, iceState) {
+  const dot = $(`ri-${peerId}`);
+  if (!dot) return;
+  dot.style.background =
+    (iceState === 'connected' || iceState === 'completed') ? '#00ff88' :
+    iceState === 'checking'                                ? '#ffaa00' : '#ff2244';
+}
+
+/**
+ * Send an offer to peerId.
+ * Guarded by peerState to prevent glare (double-offer).
+ * Always creates a fresh RTCPeerConnection.
+ */
 async function initiateOffer(peerId) {
-  if (peerLock[peerId]) {
-    console.log(`[Room] Offer to ${peerId} skipped — lock: ${peerLock[peerId]}`);
+  if (peerState[peerId] === 'offering' || peerState[peerId] === 'answering') {
+    console.log(`[Room] initiateOffer(${peerId}) skipped — state=${peerState[peerId]}`);
     return;
   }
-  peerLock[peerId] = 'offering';
+  peerState[peerId] = 'offering';
+  console.log(`[Room] initiateOffer → ${peerId}`);
 
   try {
-    const pc = await createRoomPC(peerId);
-    const offer = await pc.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true });
+    const pc    = await createRoomPC(peerId);
+    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
     socket.emit('room_offer', { targetId: peerId, offer });
-    console.log(`[Room] Offer sent → ${peerId}`);
+    console.log(`[Room] offer sent → ${peerId} signalingState=${pc.signalingState}`);
+    // peerState released in room_answer handler
   } catch (e) {
     console.error('[Room] initiateOffer error:', e);
-    delete peerLock[peerId];
+    peerState[peerId] = 'idle';
   }
-  // Lock released in room_answer handler after answer is processed
 }
 
 function closeAllRoomPeers() {
   for (const [id, pc] of Object.entries(roomPeers)) {
-    pc.onicecandidate = null; pc.ontrack = null;
-    pc.onconnectionstatechange = null; pc.oniceconnectionstatechange = null;
-    pc.close();
+    pc.onicecandidate          = null;
+    pc.ontrack                 = null;
+    pc.onconnectionstatechange = null;
+    pc.oniceconnectionstatechange = null;
+    pc.onnegotiationneeded     = null;
+    try { pc.close(); } catch {}
   }
-  roomPeers  = {};
-  roomStreams = {};
-  Object.keys(iceQueue).forEach(k => delete iceQueue[k]);
-  Object.keys(peerLock).forEach(k => delete peerLock[k]);
+  for (const k of Object.keys(roomPeers))    delete roomPeers[k];
+  for (const k of Object.keys(roomStreams))   delete roomStreams[k];
+  for (const k of Object.keys(iceQueue))      delete iceQueue[k];
+  for (const k of Object.keys(peerState))     delete peerState[k];
+  for (const k of Object.keys(offerRetries))  delete offerRetries[k];
 }
 
 function reassignStreams() {
-  for (const [id, stream] of Object.entries(roomStreams)) {
-    const vid = $(`rv-${id}`);
-    if (vid) vid.srcObject = stream;
-  }
+  for (const [id, stream] of Object.entries(roomStreams)) attachStream(id, stream);
 }
 
-// ─── Layout ───────────────────────────────────────────
+// ─── Layout ──────────────────────────────────────────────────────────────────
 function buildLayout() {
   roomVideoPanel.innerHTML = '';
   roomVideoPanel.className = 'video-panel room-video-panel';
@@ -344,10 +444,12 @@ function buildLayout() {
   } else {
     roomVideoPanel.classList.add('layout-multi');
     const big = el('div','room-big-wrap'); big.id = 'room-big-wrap';
-    const bv  = el('video'); Object.assign(bv, { id:'room-big-video', autoplay:true, playsInline:true, muted:true });
+    const bv  = el('video');
+    Object.assign(bv, { id:'room-big-video', autoplay:true, playsInline:true, muted:true });
     if (localStream) bv.srcObject = localStream;
     big.appendChild(bv);
-    const bl = el('div','video-label local-label'); bl.id='room-big-label'; bl.textContent='YOU'; big.appendChild(bl);
+    const bl = el('div','video-label local-label'); bl.id='room-big-label'; bl.textContent='YOU';
+    big.appendChild(bl);
     corners(big); roomVideoPanel.appendChild(big);
 
     const strip = el('div','room-strip'); strip.id='room-strip';
@@ -362,7 +464,7 @@ function scheduleLayout() {
   rebuildTimer = setTimeout(() => { buildLayout(); reassignStreams(); }, 150);
 }
 
-// DOM helpers
+// ─── DOM helpers ─────────────────────────────────────────────────────────────
 function el(tag, cls) { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
 function corners(box) {
   ['tl','tr','bl','br'].forEach(c => { const d=el('div',`video-corner ${c}`); box.appendChild(d); });
@@ -379,7 +481,8 @@ function myVideoBox() {
 
 function remoteVideoBox(m) {
   const box = el('div','video-box remote-box'); box.id=`rbox-${m.socketId}`;
-  const vid = el('video'); Object.assign(vid, {id:`rv-${m.socketId}`, autoplay:true, playsInline:true});
+  const vid = el('video');
+  Object.assign(vid, {id:`rv-${m.socketId}`, autoplay:true, playsInline:true});
   box.appendChild(vid);
   const lbl = el('div','video-label remote-label'); lbl.textContent=m.name.toUpperCase(); box.appendChild(lbl);
   const ind = el('div','conn-indicator'); ind.id=`ri-${m.socketId}`; box.appendChild(ind);
@@ -403,17 +506,14 @@ function remoteThumb(m) {
 
   const ov = el('div','thumb-overlay');
 
-  // Audio toggle
   const ba = el('button','thumb-ctrl-btn'); ba.innerHTML='🔊'; ba.title='Mute audio locally';
   ba.onclick = e => { e.stopPropagation(); toggleRemoteAudio(m.socketId, v, ba); };
   ov.appendChild(ba);
 
-  // Video toggle
   const bv2 = el('button','thumb-ctrl-btn'); bv2.innerHTML='📷'; bv2.title='Hide video locally';
   bv2.onclick = e => { e.stopPropagation(); toggleRemoteVideo(m.socketId, v, bv2); };
   ov.appendChild(bv2);
 
-  // Force-mute all
   const bf = el('button','thumb-ctrl-btn thumb-ctrl-silence'); bf.innerHTML='🔕'; bf.title='Force mute for everyone';
   bf.onclick = e => {
     e.stopPropagation();
@@ -432,7 +532,7 @@ function focusBigRemote(m) {
   const bw = $('room-big-wrap'); if (!bw) return;
   focusedPeerId = m.socketId;
   const bv = $('room-big-video'), bl = $('room-big-label');
-  const v = $(`rv-${m.socketId}`);
+  const v  = $(`rv-${m.socketId}`);
   if (v?.srcObject) { bv.srcObject = v.srcObject; bv.muted = false; }
   if (bl) bl.textContent = m.name.toUpperCase();
   bw.classList.add('focused-remote');
@@ -467,7 +567,7 @@ function toggleRemoteVideo(id, v, btn) {
   showToast(remoteVideoOff[id] ? '📷 Video hidden' : '📷 Video shown');
 }
 
-// ─── Room Chat ────────────────────────────────────────
+// ─── Room Chat ───────────────────────────────────────────────────────────────
 function roomSys(text) {
   const d = el('div','sys-msg'); d.textContent = text;
   roomMsgContainer.appendChild(d);
@@ -483,7 +583,7 @@ function roomMsg(text, type, from) {
   roomMsgContainer.appendChild(w);
   roomMsgContainer.scrollTop = roomMsgContainer.scrollHeight;
   w.style.cssText = `opacity:0;transform:translateX(${type==='sent'?'10px':'-10px'})`;
-  requestAnimationFrame(() => { w.style.transition = 'opacity .15s,transform .15s'; w.style.opacity='1'; w.style.transform='none'; });
+  requestAnimationFrame(() => { w.style.transition='opacity .15s,transform .15s'; w.style.opacity='1'; w.style.transform='none'; });
 }
 
 function sendRoomMsg() {
@@ -492,7 +592,7 @@ function sendRoomMsg() {
   roomMsg(t, 'sent', null); roomChatInput.value = '';
 }
 
-// ─── Lobby ────────────────────────────────────────────
+// ─── Lobby ───────────────────────────────────────────────────────────────────
 function updateLobby(members) {
   roomMembers = members;
   lobbyMemberCount.textContent = members.length;
@@ -510,14 +610,14 @@ function updateMemberCount() {
   if (lobbyMemberCount)  lobbyMemberCount.textContent  = roomMembers.length;
 }
 
-// ─── Socket — single instance, full cleanup ────────────
-// FIX: Always destroy old socket completely before creating a new one.
-// Without this, the old socket auto-reconnects in the background, its
-// handlers share the same roomPeers map, and stale answers arrive on
-// new PeerConnections that are already in "stable" state → the crash.
+// ─── Socket initialisation ───────────────────────────────────────────────────
+// Rules:
+//  • Every call fully tears down the previous socket (listeners + transport).
+//  • Socket.IO starts on polling for Render cold-starts, upgrades to WS.
+//  • We handle both "connect" (first time) and "reconnect" (automatic retry).
 function initSocket() {
   if (socket) {
-    console.log('[SOCKET] Destroying old socket before reinit');
+    console.log('[SOCKET] Destroying previous socket');
     socket.removeAllListeners();
     try { socket.io.removeAllListeners(); } catch {}
     socket.disconnect();
@@ -525,31 +625,41 @@ function initSocket() {
   }
 
   socket = io({
-    transports: ['websocket'],
-    upgrade: false,              // never upgrade — keeps single transport
-    reconnection: true,
-    reconnectionAttempts: 4,
-    reconnectionDelay: 1500,
-    reconnectionDelayMax: 5000,
-    timeout: 10000,
+    transports:             ['polling', 'websocket'],  // polling first → Render OK
+    upgrade:                true,
+    reconnection:           true,
+    reconnectionAttempts:   Infinity,
+    reconnectionDelay:      1500,
+    reconnectionDelayMax:   8000,
+    randomizationFactor:    0.4,
+    timeout:                20000,
   });
 
+  // ── Transport events ───────────────────────────────────────────────────────
   socket.on('connect', () => {
     mySocketId = socket.id;
-    console.log('[SOCKET] Connected:', socket.id);
+    console.log('[SOCKET] connected id=', socket.id, 'transport=', socket.io.engine.transport.name);
   });
 
   socket.on('disconnect', reason => {
-    console.log('[SOCKET] Disconnected:', reason);
-    showToast('⚠ Connection lost — reconnecting…');
+    console.log('[SOCKET] disconnected reason=', reason);
+    if (reason !== 'io client disconnect') showToast('⚠ Connection lost — reconnecting…');
   });
 
-  // Auto-rejoin room after Socket.IO reconnects (same socket obj, new id)
-  socket.io.on('reconnect', () => {
+  socket.on('connect_error', err => {
+    console.warn('[SOCKET] connect_error:', err.message);
+  });
+
+  // After a successful reconnect the socket gets a NEW id.
+  // Re-register in the room so signaling works again.
+  socket.io.on('reconnect', attempt => {
     mySocketId = socket.id;
-    console.log('[SOCKET] Reconnected:', socket.id);
+    console.log('[SOCKET] reconnected attempt=', attempt, 'new id=', socket.id);
     if (currentRoomId && screens.roomChat.classList.contains('active')) {
       showToast('🔄 Reconnected — rejoining room…');
+      // join_room handler on server will set started=true → triggers isRejoin path
+      socket.emit('join_room', { roomId: currentRoomId, password: lastRoomPassword, name: myName });
+    } else if (currentRoomId && screens.roomLobby.classList.contains('active')) {
       socket.emit('join_room', { roomId: currentRoomId, password: lastRoomPassword, name: myName });
     }
   });
@@ -558,8 +668,8 @@ function initSocket() {
     Object.values(onlineCountEls).forEach(e => { if (e) e.textContent = count; });
   });
 
-  // ══ Stranger events ══════════════════════════════════
-  socket.on('waiting', () => console.log('[Queue] Waiting'));
+  // ══ Stranger events ════════════════════════════════════════════════════════
+  socket.on('waiting', () => console.log('[Queue] waiting'));
 
   socket.on('matched', async ({ partnerName, initiator }) => {
     partnerNameDisplay.textContent = partnerName.toUpperCase();
@@ -575,15 +685,14 @@ function initSocket() {
       const ans = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(ans);
       socket.emit('webrtc_answer', { answer: ans });
-    } catch (e) { console.error('[Stranger] Answer error:', e); }
+    } catch (e) { console.error('[Stranger] answer error:', e); }
   });
 
   socket.on('webrtc_answer', async ({ answer }) => {
     if (!peerConnection) return;
-    // Guard: only in have-local-offer state
     if (peerConnection.signalingState !== 'have-local-offer') return;
     try { await peerConnection.setRemoteDescription(new RTCSessionDescription(answer)); }
-    catch (e) { console.error('[Stranger] Set answer error:', e); }
+    catch (e) { console.error('[Stranger] set-answer error:', e); }
   });
 
   socket.on('webrtc_ice', async ({ candidate }) => {
@@ -595,7 +704,7 @@ function initSocket() {
   socket.on('chat_message', ({ from, text }) => addMsg(text, 'received', from));
   socket.on('partner_left', () => { closePeerConnection(); addSys('Stranger disconnected.'); showModal(); });
 
-  // ══ Room events ══════════════════════════════════════
+  // ══ Room events ════════════════════════════════════════════════════════════
   socket.on('room_created', ({ roomId, name, members }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
     lobbyRoomId.textContent = roomId; updateLobby(members);
@@ -604,11 +713,11 @@ function initSocket() {
 
   socket.on('room_joined', ({ roomId, name, members, started }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
-    mySocketId = socket.id;
+    mySocketId    = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
-      showToast('✓ Rejoined session — reconnecting…');
-      startRoomSession(true);        // isRejoin = true
+      showToast('✓ Rejoined — reconnecting video…');
+      startRoomSession(true);   // rejoin path → send offers to everyone
     } else {
       updateLobby(members); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
     }
@@ -622,104 +731,155 @@ function initSocket() {
 
     if (sessionActive && screens.roomChat.classList.contains('active')) {
       scheduleLayout();
-      // ── KEY FIX ──────────────────────────────────────
-      // Do NOT call initiateOffer here.
-      // The newly joined member sends offers to us (in startRoomSession).
-      // If we also offer simultaneously → ICE glare → "wrong state: stable"
-      // ─────────────────────────────────────────────────
+      // ── Glare prevention ────────────────────────────────────────────────
+      // The newcomer sends offers to US (see startRoomSession isRejoin=true).
+      // We must NOT also offer to them — that causes both sides to be in
+      // 'have-local-offer' and neither can accept the other's answer.
+      //
+      // Exception: if we are the newcomer ourselves (socketId === mySocketId)
+      // that case is handled inside startRoomSession, not here.
+      // ─────────────────────────────────────────────────────────────────────
+      console.log(`[Room] member_joined(${socketId}) sessionActive — waiting for their offers`);
     }
   });
 
   socket.on('room_member_left', ({ socketId, name, members }) => {
     roomMembers = members; updateMemberCount();
     roomSys(`${name} left`); showToast(`🔴 ${name} left`);
-    if (roomPeers[socketId]) { roomPeers[socketId].close(); delete roomPeers[socketId]; }
-    delete roomStreams[socketId]; delete silenceState[socketId];
-    delete iceQueue[socketId]; delete peerLock[socketId];
+    if (roomPeers[socketId]) {
+      const old = roomPeers[socketId];
+      old.onicecandidate = old.ontrack = old.onconnectionstatechange = old.oniceconnectionstatechange = null;
+      old.close();
+      delete roomPeers[socketId];
+    }
+    delete roomStreams[socketId];
+    delete silenceState[socketId];
+    delete iceQueue[socketId];
+    delete peerState[socketId];
+    delete offerRetries[socketId];
     ($(`rbox-${socketId}`) || $(`rthumb-${socketId}`))?.remove();
     scheduleLayout();
   });
 
-  // ── room_offer: someone sent us an offer ──────────────
+  // ── room_offer: peer sends us an offer ───────────────────────────────────
   socket.on('room_offer', async ({ fromId, offer }) => {
-    if (peerLock[fromId] === 'answering') {
-      console.warn(`[Room] Dropping duplicate offer from ${fromId}`);
+    console.log(`[Room] room_offer from ${fromId} | our peerState=${peerState[fromId]}`);
+
+    // Glare resolution: if we are ALSO offering to the same peer, the higher
+    // socket-id string wins and must answer; the lower one re-offers later.
+    if (peerState[fromId] === 'offering') {
+      if (mySocketId > fromId) {
+        // We win → ignore their offer; they will answer ours.
+        console.log(`[Room] Glare: we win vs ${fromId} — ignoring their offer`);
+        return;
+      } else {
+        // They win → roll back our offer and answer theirs instead.
+        console.log(`[Room] Glare: they win vs ${fromId} — rolling back and answering`);
+        peerState[fromId] = 'idle';
+      }
+    }
+
+    if (peerState[fromId] === 'answering') {
+      console.warn(`[Room] Duplicate offer from ${fromId} while answering — dropping`);
       return;
     }
-    peerLock[fromId] = 'answering';
+
+    peerState[fromId] = 'answering';
 
     try {
-      // Always create a fresh PC for the offerer
       const pc = await createRoomPC(fromId);
 
-      // Guard: new PC must be in 'stable' to accept offer (it always is,
-      // but this makes the intent explicit and catches edge cases)
       if (pc.signalingState !== 'stable') {
-        console.warn(`[Room] Offer from ${fromId} ignored: signalingState=${pc.signalingState}`);
-        delete peerLock[fromId]; return;
+        console.warn(`[Room] offer from ${fromId}: expected stable, got ${pc.signalingState}`);
+        peerState[fromId] = 'idle';
+        return;
       }
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      await flushIceQueue(fromId);   // drain any early candidates
+      await flushIceQueue(fromId);   // drain buffered ICE candidates
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('room_answer', { targetId: fromId, answer });
-      console.log(`[Room] Answer sent → ${fromId}`);
+
+      console.log(`[Room] answer sent → ${fromId} signalingState=${pc.signalingState}`);
     } catch (e) {
       console.error('[Room] room_offer handler error:', e);
     } finally {
-      delete peerLock[fromId];
+      peerState[fromId] = 'idle';
     }
   });
 
-  // ── room_answer: our offer was accepted ───────────────
-  // FIX: signalingState MUST be 'have-local-offer' — if it's 'stable',
-  // this is a stale/duplicate answer from a ghost socket → discard it.
+  // ── room_answer: our offer was accepted ──────────────────────────────────
   socket.on('room_answer', async ({ fromId, answer }) => {
     const pc = roomPeers[fromId];
     if (!pc) {
-      console.warn(`[Room] Answer from ${fromId}: no PC found — discarding`);
+      console.warn(`[Room] room_answer from ${fromId}: no PC — discarding`);
       return;
     }
 
-    const state = pc.signalingState;
-    if (state !== 'have-local-offer') {
-      // This is the crash we're fixing: "Called in wrong state: stable"
-      console.warn(`[Room] Answer from ${fromId} discarded — signalingState: ${state}`);
-      delete peerLock[fromId];
+    const ss = pc.signalingState;
+    console.log(`[Room] room_answer from ${fromId} signalingState=${ss}`);
+
+    if (ss !== 'have-local-offer') {
+      // Stale answer (from a ghost socket / duplicate) — discard silently.
+      console.warn(`[Room] room_answer from ${fromId} discarded — wrong state: ${ss}`);
+      peerState[fromId] = 'idle';
       return;
     }
 
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      await flushIceQueue(fromId);   // drain any early candidates
-      console.log(`[Room] Answer applied from ${fromId} ✓`);
+      await flushIceQueue(fromId);
+      console.log(`[Room] answer applied from ${fromId} ✓`);
     } catch (e) {
       console.error('[Room] room_answer handler error:', e);
     } finally {
-      delete peerLock[fromId];   // release lock after answer is processed
+      peerState[fromId] = 'idle';
     }
   });
 
-  // ── room_ice: trickle ICE candidates ─────────────────
-  // FIX: If remote desc not yet set, queue the candidate instead of dropping.
+  // ── room_ice: trickle candidates ─────────────────────────────────────────
   socket.on('room_ice', async ({ fromId, candidate }) => {
     const pc = roomPeers[fromId];
-    if (!pc) return;
-
-    if (!pc.remoteDescription?.type) {
-      enqueueIce(fromId, candidate);   // buffer until after setRemoteDescription
+    if (!pc) {
+      // Buffer even if PC doesn't exist yet — will be flushed in createRoomPC path
+      enqueueIce(fromId, candidate);
       return;
     }
-    try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
-    catch (e) { console.warn('[Room] ICE add:', e.message); }
+
+    // If remote description not yet set, buffer the candidate
+    if (!pc.remoteDescription?.type) {
+      enqueueIce(fromId, candidate);
+      return;
+    }
+
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (e) {
+      // Null candidate == end-of-candidates marker — not an error
+      if (candidate && candidate.candidate !== '') {
+        console.warn('[Room] ICE addCandidate error:', e.message);
+      }
+    }
   });
 
+  // ── room_request_offer: a peer asked us to re-offer ──────────────────────
+  socket.on('room_request_offer', ({ fromId }) => {
+    console.log(`[Room] re-offer requested by ${fromId}`);
+    peerState[fromId] = 'idle';
+    initiateOffer(fromId);
+  });
+
+  // ── Room chat / media / state ─────────────────────────────────────────────
   socket.on('room_message', ({ from, text }) => roomMsg(text, 'received', from));
 
   socket.on('room_member_media', ({ socketId, audioMuted, videoOff }) => {
     const b = $(`rbox-${socketId}`) || $(`rthumb-${socketId}`);
-    if (b) { b.classList.toggle('remote-audio-muted', !!audioMuted); b.classList.toggle('remote-video-off', !!videoOff); }
+    if (b) {
+      b.classList.toggle('remote-audio-muted', !!audioMuted);
+      b.classList.toggle('remote-video-off',   !!videoOff);
+    }
   });
 
   socket.on('room_force_muted', ({ byName, muted }) => {
@@ -733,48 +893,68 @@ function initSocket() {
   });
 }
 
-// ─── Start Room Session ───────────────────────────────
-// isRejoin=true  → joining an already-live session (send offers to ALL)
-// isRejoin=false → fresh lobby start (index-based, no glare)
+// ─── Start / rejoin room session ─────────────────────────────────────────────
+// isRejoin = true  → session is already live; we joined late or reconnected.
+//                    We are responsible for offering to EVERYONE already there.
+// isRejoin = false → lobby "Start" was clicked; members use index ordering
+//                    to offer only downward and avoid glare.
 async function startRoomSession(isRejoin = false) {
   if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
 
   if (isRejoin) {
-    closeAllRoomPeers();   // clean slate — no stale connections
+    // Clean slate: tear down all stale connections before building new ones
+    closeAllRoomPeers();
   }
 
   showScreen('roomChat');
-  buildLayout(); reassignStreams();
+  buildLayout();
+  reassignStreams();
   roomSys(isRejoin ? 'Reconnecting video…' : 'Session started! Video connecting…');
-  socket.emit('room_start', { roomId: currentRoomId });
+
+  // Only mark the room started on a fresh start (not on rejoin / reconnect).
+  // Prevents redundant room_start from overwriting room.started that is
+  // already true and confusing the server-side sessionActive flag.
+  if (!isRejoin) {
+    socket.emit('room_start', { roomId: currentRoomId });
+  }
+
+  const others = roomMembers.filter(m => m.socketId !== mySocketId);
 
   let targets;
   if (isRejoin) {
-    // Rejoin: WE are the new entrant → offer to everyone currently in room
-    targets = roomMembers.filter(m => m.socketId !== mySocketId);
+    // Offer to ALL existing members — we are the newcomer / reconnector
+    targets = others;
   } else {
-    // Fresh start: index-based → each member offers only to earlier members
-    // [A,B,C]: B→A, C→{A,B}. No pair sends two offers → no glare.
-    const idx = roomMembers.findIndex(m => m.socketId === mySocketId);
-    targets = roomMembers.slice(0, idx);
+    // Fresh session: index-based ordering prevents glare.
+    // [A,B,C]: B→A, C→{A,B}. Each pair has exactly one offerer.
+    const myIdx = roomMembers.findIndex(m => m.socketId === mySocketId);
+    targets = roomMembers.slice(0, myIdx);
   }
 
+  console.log(`[Room] startRoomSession isRejoin=${isRejoin} | offering to ${targets.length} peers:`, targets.map(t=>t.socketId));
+
   if (targets.length > 0) {
-    // All offers fired in parallel — fastest possible connection
+    // Fire all offers in parallel for fastest connect time
     await Promise.all(targets.map(p => initiateOffer(p.socketId)));
   }
 }
 
-// ─── Room cleanup ─────────────────────────────────────
+// ─── Room cleanup ─────────────────────────────────────────────────────────────
 function cleanupRoom() {
-  closeAllRoomPeers(); stopLocalMedia();
-  currentRoomId = null; lastRoomPassword = '';
-  roomMembers = []; silenceState = {};
-  remoteAudioMuted = {}; remoteVideoOff = {};
-  roomMuted = false; roomCamOff = false;
+  closeAllRoomPeers();
+  stopLocalMedia();
+  currentRoomId    = null;
+  lastRoomPassword = '';
+  roomMembers      = [];
+  focusedPeerId    = null;
+  roomMuted        = false;
+  roomCamOff       = false;
+  for (const k of Object.keys(silenceState))     delete silenceState[k];
+  for (const k of Object.keys(remoteAudioMuted)) delete remoteAudioMuted[k];
+  for (const k of Object.keys(remoteVideoOff))   delete remoteVideoOff[k];
 }
 
-// ─── Stranger chat ────────────────────────────────────
+// ─── Stranger chat ────────────────────────────────────────────────────────────
 function clearMsgs() { messagesContainer.innerHTML = ''; }
 function addSys(t) {
   const d = el('div','sys-msg'); d.textContent = t;
@@ -793,11 +973,11 @@ function sendMsg() {
   socket.emit('chat_message', { text: t }); addMsg(t, 'sent', null); chatInput.value = '';
 }
 
-// ─── Modal ────────────────────────────────────────────
+// ─── Modal ───────────────────────────────────────────────────────────────────
 function showModal() { modalLeft.style.display = 'flex'; }
 function hideModal() { modalLeft.style.display = 'none'; }
 
-// ─── Stranger controls ────────────────────────────────
+// ─── Stranger controls ───────────────────────────────────────────────────────
 function toggleMute() {
   isMuted = !isMuted;
   localStream?.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
@@ -831,7 +1011,7 @@ function endSession() {
   showScreen('landing');
 }
 
-// ─── Room controls ────────────────────────────────────
+// ─── Room controls ────────────────────────────────────────────────────────────
 function toggleRoomMute() {
   roomMuted = !roomMuted;
   localStream?.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
@@ -855,14 +1035,15 @@ function leaveRoom() {
   cleanupRoom(); showScreen('landing');
 }
 
-// ─── Entry flows ──────────────────────────────────────
+// ─── Entry flows ──────────────────────────────────────────────────────────────
 async function startStrangerFlow() {
   myName = (strangerNameInput.value.trim().slice(0,24)) || 'Stranger';
   showScreen('waiting');
   await getLocalMedia();
   initSocket();
-  socket.on('connect', () => { mySocketId = socket.id; socket.emit('join_queue', { name: myName }); });
-  if (socket.connected) { mySocketId = socket.id; socket.emit('join_queue', { name: myName }); }
+  const go = () => { mySocketId = socket.id; socket.emit('join_queue', { name: myName }); };
+  socket.on('connect', go);
+  if (socket.connected) go();
 }
 
 async function startCreateRoomFlow() {
@@ -882,7 +1063,7 @@ async function startJoinRoomFlow() {
   const roomId = joinRoomIdInput.value.trim();
   const pass   = joinPassInput.value.trim();
   if (roomId.length !== 6) { showToast('⚠ Enter a valid 6-digit room ID'); return; }
-  if (!pass) { showToast('⚠ Enter the room password'); return; }
+  if (!pass)               { showToast('⚠ Enter the room password'); return; }
   lastRoomPassword = pass;
   await getLocalMedia();
   initSocket();
@@ -891,7 +1072,7 @@ async function startJoinRoomFlow() {
   if (socket.connected) go();
 }
 
-// ─── Event listeners ──────────────────────────────────
+// ─── Event listeners ──────────────────────────────────────────────────────────
 $('btn-mode-stranger').addEventListener('click', () => showScreen('nameStranger'));
 $('btn-mode-create').addEventListener('click',   () => showScreen('createRoom'));
 $('btn-mode-join').addEventListener('click',     () => showScreen('joinRoom'));
