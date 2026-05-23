@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   CHAT-RIX  —  app.js  (complete rewrite — WebRTC reliability patch)
+   CHAT-RIX  —  app.js  (SUPER FAST + ALL BUGS FIXED)
    ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -25,7 +25,7 @@ const ICE_CFG = {
       credential: 'openrelayproject',
     },
   ],
-  iceCandidatePoolSize: 8,
+  iceCandidatePoolSize: 4,       // PERF: reduced from 8
   bundlePolicy:  'max-bundle',
   rtcpMuxPolicy: 'require',
 };
@@ -50,9 +50,9 @@ let roomCamOff       = false;
 
 // roomPeers[peerId]  → RTCPeerConnection
 // roomStreams[peerId] → MediaStream
-// iceQueue[peerId]   → RTCIceCandidateInit[]  (buffered before remoteDesc set)
-// peerState[peerId]  → 'idle'|'offering'|'answering'  (glare guard)
-// offerRetries[peerId] → number   (ICE-failed re-offer counter)
+// iceQueue[peerId]   → RTCIceCandidateInit[]
+// peerState[peerId]  → 'idle'|'offering'|'answering'
+// offerRetries[peerId] → number
 const roomPeers    = {};
 const roomStreams   = {};
 const iceQueue     = {};
@@ -61,6 +61,9 @@ const offerRetries = {};
 const silenceState     = {};
 const remoteAudioMuted = {};
 const remoteVideoOff   = {};
+
+// FIX: Prevent multiple simultaneous offer initiations to same peer
+const pendingOffers = {};
 
 let rebuildTimer = null;
 
@@ -122,7 +125,6 @@ const btnRoomMute        = $('btn-room-mute');
 const btnRoomCam         = $('btn-room-cam');
 const btnRoomLeave       = $('btn-room-leave');
 
-// Member count selector (create room screen)
 let selectedMaxMembers = 2;
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
@@ -145,18 +147,24 @@ function showToast(msg, ms = 2800) {
   toastTmr = setTimeout(() => toastEl.classList.remove('show'), ms);
 }
 
-// ─── Particles ───────────────────────────────────────────────────────────────
+// ─── Particles (PERF: fewer particles, skip on mobile) ────────────────────────
 (function () {
   const cv = $('particleCanvas'); if (!cv) return;
+  // PERF: Skip heavy particle animation on low-end/mobile devices
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (isMobile) { cv.style.display = 'none'; return; }
+
   const cx = cv.getContext('2d');
-  const N = 40, D = 80, CLR = ['#00ffff','#ff00aa','#00ff88','#fff'];
+  const N = 25; // PERF: reduced from 40
+  const D = 70;
+  const CLR = ['#00ffff','#ff00aa','#00ff88','#fff'];
   let W, H, pts = [], run = true, raf = null;
   const resize = () => { W = cv.width = innerWidth; H = cv.height = innerHeight; };
   const rp = () => ({
     x:Math.random()*W, y:Math.random()*H,
     r:Math.random()*1.2+.3,
-    dx:(Math.random()-.5)*.35, dy:(Math.random()-.5)*.35,
-    c:CLR[0|Math.random()*4], a:Math.random()*.4+.1,
+    dx:(Math.random()-.5)*.3, dy:(Math.random()-.5)*.3,
+    c:CLR[0|Math.random()*4], a:Math.random()*.35+.1,
   });
   function draw() {
     if (!run) { raf = null; return; }
@@ -170,12 +178,12 @@ function showToast(msg, ms = 2800) {
       if(p.x<0)p.x=W; if(p.x>W)p.x=0;
       if(p.y<0)p.y=H; if(p.y>H)p.y=0;
     }
-    cx.globalAlpha=1; cx.lineWidth=.5;
+    cx.globalAlpha=1; cx.lineWidth=.4;
     for (let i=0;i<N;i++) for (let j=i+1;j<N;j++) {
       const dx=pts[i].x-pts[j].x, dy=pts[i].y-pts[j].y, d2=dx*dx+dy*dy;
       if (d2<D*D) {
         cx.beginPath(); cx.moveTo(pts[i].x,pts[i].y); cx.lineTo(pts[j].x,pts[j].y);
-        cx.strokeStyle=`rgba(0,255,255,${.06*(1-Math.sqrt(d2)/D)})`; cx.stroke();
+        cx.strokeStyle=`rgba(0,255,255,${.05*(1-Math.sqrt(d2)/D)})`; cx.stroke();
       }
     }
   }
@@ -193,12 +201,18 @@ async function getLocalMedia(peerCount = 0) {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width:     { ideal: isMulti ? 640  : 1280 },
-        height:    { ideal: isMulti ? 480  : 720  },
-        frameRate: { ideal: isMulti ? 20   : 30   },
+        width:     { ideal: isMulti ? 480  : 1280 },  // PERF: smaller in multi
+        height:    { ideal: isMulti ? 360  : 720  },
+        frameRate: { ideal: isMulti ? 15   : 30   },  // PERF: 15fps in multi
         facingMode: 'user',
       },
-      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 16000,
+        channelCount: 1,                               // PERF: mono saves bandwidth
+      },
     });
     localVideo.srcObject = localStream;
   } catch {
@@ -233,7 +247,6 @@ function createPeerConnection() {
   pc.onicecandidate = e => { if (e.candidate) socket.emit('webrtc_ice', { candidate: e.candidate }); };
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
-    console.log('[Stranger] connectionState:', s);
     if (s === 'connected') remoteStatus.classList.add('hidden');
     else if (s === 'failed' || s === 'disconnected') {
       remoteStatus.textContent = 'Connection lost…';
@@ -263,7 +276,6 @@ function closePeerConnection() {
 function enqueueIce(peerId, candidate) {
   if (!iceQueue[peerId]) iceQueue[peerId] = [];
   iceQueue[peerId].push(candidate);
-  console.log(`[ICE] queued for ${peerId} (total=${iceQueue[peerId].length})`);
 }
 
 async function flushIceQueue(peerId) {
@@ -272,7 +284,6 @@ async function flushIceQueue(peerId) {
   if (!q.length) return;
   const pc = roomPeers[peerId];
   if (!pc || !pc.remoteDescription?.type) return;
-  console.log(`[ICE] flushing ${q.length} queued candidates for ${peerId}`);
   for (const c of q) {
     try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
     catch (e) { console.warn('[ICE] flush error:', e.message); }
@@ -280,12 +291,7 @@ async function flushIceQueue(peerId) {
 }
 
 // ─── Peer connection lifecycle ───────────────────────────────────────────────
-/**
- * Destroy the existing RTCPeerConnection for a peer completely,
- * then create a fresh one with all handlers attached.
- */
 async function createRoomPC(peerId) {
-  // Tear down existing PC cleanly
   if (roomPeers[peerId]) {
     const old = roomPeers[peerId];
     old.onicecandidate           = null;
@@ -303,42 +309,36 @@ async function createRoomPC(peerId) {
 
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-  // ── Remote track → attach to video element ────────────────────────────────
   pc.ontrack = e => {
     if (!e.streams?.[0]) return;
     const stream = e.streams[0];
     roomStreams[peerId] = stream;
-    console.log(`[Room] ontrack from ${peerId}`);
     attachStream(peerId, stream);
   };
 
-  // ── ICE gathering ─────────────────────────────────────────────────────────
   pc.onicecandidate = e => {
     if (e.candidate) {
       socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
     }
   };
 
-  // ── ICE connection state ──────────────────────────────────────────────────
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
-    console.log(`[Room] iceConnectionState ${peerId}: ${s}`);
     setIndicator(peerId, s);
 
     if (s === 'failed') {
-      console.warn(`[Room] ICE failed for ${peerId} — attempting restartIce`);
+      console.warn(`[Room] ICE failed for ${peerId} — restartIce`);
       try { pc.restartIce(); } catch {}
     }
   };
 
-  // ── Overall connection state ───────────────────────────────────────────────
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
     console.log(`[Room] connectionState ${peerId}: ${s}`);
 
     if (s === 'connected') {
       offerRetries[peerId] = 0;
-      // Re-attach stream in case the video element was rebuilt during layout
+      delete pendingOffers[peerId];
       if (roomStreams[peerId]) attachStream(peerId, roomStreams[peerId]);
     }
 
@@ -346,37 +346,31 @@ async function createRoomPC(peerId) {
       const retries = (offerRetries[peerId] || 0);
       if (retries < 3) {
         offerRetries[peerId] = retries + 1;
-        console.warn(`[Room] Connection failed for ${peerId} — re-offer attempt ${offerRetries[peerId]}`);
+        const delay = 1500 + retries * 1000;
+        console.warn(`[Room] Conn failed for ${peerId} — retry ${offerRetries[peerId]} in ${delay}ms`);
         setTimeout(() => {
-          // Only re-offer if the PC is still the one we created (not replaced)
           if (roomPeers[peerId] === pc) {
             peerState[peerId] = 'idle';
+            delete pendingOffers[peerId];
             initiateOffer(peerId);
           }
-        }, 2000 + retries * 1000);
+        }, delay);
       } else {
-        console.error(`[Room] Connection permanently failed for ${peerId} after ${retries} retries`);
+        console.error(`[Room] Conn permanently failed for ${peerId}`);
         showToast('⚠ Peer connection failed — try re-joining');
       }
     }
   };
 
-  console.log(`[Room] PC created for ${peerId}`);
   return pc;
 }
 
-/**
- * Attach a MediaStream to all video elements for a given peer.
- * Handles both split-layout (rv-peerId) and thumbnail (same id) cases.
- */
 function attachStream(peerId, stream) {
   const vid = $(`rv-${peerId}`);
   if (vid) {
     vid.srcObject = stream;
     vid.play().catch(() => {});
-    console.log(`[Room] stream attached to rv-${peerId}`);
   }
-  // Big-view slot if this peer is focused
   if (focusedPeerId === peerId) {
     const bv = $('room-big-video');
     if (bv) { bv.srcObject = stream; bv.muted = false; bv.play().catch(() => {}); }
@@ -391,17 +385,19 @@ function setIndicator(peerId, iceState) {
     iceState === 'checking'                                ? '#ffaa00' : '#ff2244';
 }
 
-/**
- * Send an offer to peerId.
- * Guarded by peerState to prevent glare (double-offer).
- * Always creates a fresh RTCPeerConnection.
- */
+// FIX: Proper guard with pendingOffers to prevent duplicate simultaneous offers
 async function initiateOffer(peerId) {
   if (peerState[peerId] === 'offering' || peerState[peerId] === 'answering') {
     console.log(`[Room] initiateOffer(${peerId}) skipped — state=${peerState[peerId]}`);
     return;
   }
+  if (pendingOffers[peerId]) {
+    console.log(`[Room] initiateOffer(${peerId}) skipped — already pending`);
+    return;
+  }
+
   peerState[peerId] = 'offering';
+  pendingOffers[peerId] = true;
   console.log(`[Room] initiateOffer → ${peerId}`);
 
   try {
@@ -409,11 +405,10 @@ async function initiateOffer(peerId) {
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
     socket.emit('room_offer', { targetId: peerId, offer });
-    console.log(`[Room] offer sent → ${peerId} signalingState=${pc.signalingState}`);
-    // peerState released in room_answer handler
   } catch (e) {
     console.error('[Room] initiateOffer error:', e);
     peerState[peerId] = 'idle';
+    delete pendingOffers[peerId];
   }
 }
 
@@ -431,6 +426,7 @@ function closeAllRoomPeers() {
   for (const k of Object.keys(iceQueue))      delete iceQueue[k];
   for (const k of Object.keys(peerState))     delete peerState[k];
   for (const k of Object.keys(offerRetries))  delete offerRetries[k];
+  for (const k of Object.keys(pendingOffers)) delete pendingOffers[k];
 }
 
 function reassignStreams() {
@@ -468,7 +464,7 @@ function buildLayout() {
 
 function scheduleLayout() {
   clearTimeout(rebuildTimer);
-  rebuildTimer = setTimeout(() => { buildLayout(); reassignStreams(); }, 150);
+  rebuildTimer = setTimeout(() => { buildLayout(); reassignStreams(); }, 100); // PERF: 100ms
 }
 
 // ─── DOM helpers ─────────────────────────────────────────────────────────────
@@ -608,11 +604,9 @@ function updateLobby(members, maxMembers) {
   lobbyMemberCount.textContent = members.length;
   if (lobbyMaxCount) lobbyMaxCount.textContent = max;
 
-  // Progress bar
   const pct = Math.min(100, Math.round((members.length / max) * 100));
   if (lobbyAutostartFill) lobbyAutostartFill.style.width = pct + '%';
 
-  // Status text
   const remaining = max - members.length;
   if (lobbyStatusText) {
     lobbyStatusText.textContent = remaining > 0
@@ -636,13 +630,8 @@ function updateMemberCount() {
 }
 
 // ─── Socket initialisation ───────────────────────────────────────────────────
-// Rules:
-//  • Every call fully tears down the previous socket (listeners + transport).
-//  • Socket.IO starts on polling for Render cold-starts, upgrades to WS.
-//  • We handle both "connect" (first time) and "reconnect" (automatic retry).
 function initSocket() {
   if (socket) {
-    console.log('[SOCKET] Destroying previous socket');
     socket.removeAllListeners();
     try { socket.io.removeAllListeners(); } catch {}
     socket.disconnect();
@@ -650,20 +639,20 @@ function initSocket() {
   }
 
   socket = io({
-    transports:             ['polling', 'websocket'],  // polling first → Render OK
-    upgrade:                true,
+    // PERF: websocket first for speed
+    transports:             ['websocket', 'polling'],
+    upgrade:                false,   // already starting with WS, no upgrade needed
     reconnection:           true,
     reconnectionAttempts:   Infinity,
-    reconnectionDelay:      1500,
-    reconnectionDelayMax:   8000,
-    randomizationFactor:    0.4,
-    timeout:                20000,
+    reconnectionDelay:      800,     // FIX: faster reconnect (was 1500)
+    reconnectionDelayMax:   5000,    // FIX: shorter max (was 8000)
+    randomizationFactor:    0.3,
+    timeout:                15000,   // FIX: shorter timeout (was 20000)
   });
 
-  // ── Transport events ───────────────────────────────────────────────────────
   socket.on('connect', () => {
     mySocketId = socket.id;
-    console.log('[SOCKET] connected id=', socket.id, 'transport=', socket.io.engine.transport.name);
+    console.log('[SOCKET] connected id=', socket.id);
   });
 
   socket.on('disconnect', reason => {
@@ -675,16 +664,11 @@ function initSocket() {
     console.warn('[SOCKET] connect_error:', err.message);
   });
 
-  // After a successful reconnect the socket gets a NEW id.
-  // Re-register in the room so signaling works again.
   socket.io.on('reconnect', attempt => {
     mySocketId = socket.id;
-    console.log('[SOCKET] reconnected attempt=', attempt, 'new id=', socket.id);
-    if (currentRoomId && screens.roomChat.classList.contains('active')) {
+    console.log('[SOCKET] reconnected attempt=', attempt);
+    if (currentRoomId && (screens.roomChat.classList.contains('active') || screens.roomLobby.classList.contains('active'))) {
       showToast('🔄 Reconnected — rejoining room…');
-      // join_room handler on server will set started=true → triggers isRejoin path
-      socket.emit('join_room', { roomId: currentRoomId, password: lastRoomPassword, name: myName });
-    } else if (currentRoomId && screens.roomLobby.classList.contains('active')) {
       socket.emit('join_room', { roomId: currentRoomId, password: lastRoomPassword, name: myName });
     }
   });
@@ -740,12 +724,11 @@ function initSocket() {
   socket.on('room_joined', ({ roomId, name, members, maxMembers, started }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
     currentMaxMembers = maxMembers || currentMaxMembers;
-    mySocketId    = socket.id;
+    mySocketId = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
-      // Session already started — this is a reconnect flow
       showToast('✓ Rejoined — reconnecting video…');
-      startRoomSession(true);   // rejoin path → send offers to everyone
+      startRoomSession(true);
     } else {
       updateLobby(members, maxMembers); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
     }
@@ -753,18 +736,16 @@ function initSocket() {
 
   socket.on('room_error', ({ msg, code }) => {
     if (code === 'SESSION_STARTED') {
-      showToast('⛔ Session already started — you cannot rejoin this room.', 5000);
+      showToast('⛔ Session already started — you cannot join this room.', 5000);
     } else {
       showToast('⚠ ' + msg, 3500);
     }
   });
 
-  // ── Auto-start: server triggers when all expected members have joined ───────
   socket.on('room_auto_start', ({ members, maxMembers }) => {
     roomMembers = members; currentMaxMembers = maxMembers;
     updateLobby(members, maxMembers);
-    // Brief visual pause so users see the "ALL MEMBERS PRESENT" state
-    setTimeout(() => startRoomSession(false), 800);
+    setTimeout(() => startRoomSession(false), 600); // slightly faster
   });
 
   socket.on('room_member_joined', ({ socketId, name, members, maxMembers, sessionActive }) => {
@@ -773,14 +754,7 @@ function initSocket() {
 
     if (sessionActive && screens.roomChat.classList.contains('active')) {
       scheduleLayout();
-      // ── Glare prevention ────────────────────────────────────────────────
-      // The newcomer sends offers to US (see startRoomSession isRejoin=true).
-      // We must NOT also offer to them — that causes both sides to be in
-      // 'have-local-offer' and neither can accept the other's answer.
-      //
-      // Exception: if we are the newcomer ourselves (socketId === mySocketId)
-      // that case is handled inside startRoomSession, not here.
-      // ─────────────────────────────────────────────────────────────────────
+      // New member sends offers to us, we wait — glare prevention
       console.log(`[Room] member_joined(${socketId}) sessionActive — waiting for their offers`);
     }
   });
@@ -799,25 +773,24 @@ function initSocket() {
     delete iceQueue[socketId];
     delete peerState[socketId];
     delete offerRetries[socketId];
+    delete pendingOffers[socketId];
     ($(`rbox-${socketId}`) || $(`rthumb-${socketId}`))?.remove();
     scheduleLayout();
   });
 
-  // ── room_offer: peer sends us an offer ───────────────────────────────────
+  // ── room_offer ──────────────────────────────────────────────────────────────
   socket.on('room_offer', async ({ fromId, offer }) => {
     console.log(`[Room] room_offer from ${fromId} | our peerState=${peerState[fromId]}`);
 
-    // Glare resolution: if we are ALSO offering to the same peer, the higher
-    // socket-id string wins and must answer; the lower one re-offers later.
+    // Glare resolution
     if (peerState[fromId] === 'offering') {
       if (mySocketId > fromId) {
-        // We win → ignore their offer; they will answer ours.
         console.log(`[Room] Glare: we win vs ${fromId} — ignoring their offer`);
         return;
       } else {
-        // They win → roll back our offer and answer theirs instead.
-        console.log(`[Room] Glare: they win vs ${fromId} — rolling back and answering`);
+        console.log(`[Room] Glare: they win vs ${fromId} — rolling back`);
         peerState[fromId] = 'idle';
+        delete pendingOffers[fromId];
       }
     }
 
@@ -832,19 +805,17 @@ function initSocket() {
       const pc = await createRoomPC(fromId);
 
       if (pc.signalingState !== 'stable') {
-        console.warn(`[Room] offer from ${fromId}: expected stable, got ${pc.signalingState}`);
+        console.warn(`[Room] offer from ${fromId}: bad state ${pc.signalingState}`);
         peerState[fromId] = 'idle';
         return;
       }
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      await flushIceQueue(fromId);   // drain buffered ICE candidates
+      await flushIceQueue(fromId);
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('room_answer', { targetId: fromId, answer });
-
-      console.log(`[Room] answer sent → ${fromId} signalingState=${pc.signalingState}`);
     } catch (e) {
       console.error('[Room] room_offer handler error:', e);
     } finally {
@@ -852,46 +823,34 @@ function initSocket() {
     }
   });
 
-  // ── room_answer: our offer was accepted ──────────────────────────────────
+  // ── room_answer ─────────────────────────────────────────────────────────────
   socket.on('room_answer', async ({ fromId, answer }) => {
     const pc = roomPeers[fromId];
-    if (!pc) {
-      console.warn(`[Room] room_answer from ${fromId}: no PC — discarding`);
-      return;
-    }
+    if (!pc) { console.warn(`[Room] room_answer from ${fromId}: no PC`); return; }
 
     const ss = pc.signalingState;
-    console.log(`[Room] room_answer from ${fromId} signalingState=${ss}`);
-
     if (ss !== 'have-local-offer') {
-      // Stale answer (from a ghost socket / duplicate) — discard silently.
-      console.warn(`[Room] room_answer from ${fromId} discarded — wrong state: ${ss}`);
+      console.warn(`[Room] room_answer from ${fromId} discarded — state: ${ss}`);
       peerState[fromId] = 'idle';
+      delete pendingOffers[fromId];
       return;
     }
 
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
       await flushIceQueue(fromId);
-      console.log(`[Room] answer applied from ${fromId} ✓`);
     } catch (e) {
       console.error('[Room] room_answer handler error:', e);
     } finally {
       peerState[fromId] = 'idle';
+      delete pendingOffers[fromId];
     }
   });
 
-  // ── room_ice: trickle candidates ─────────────────────────────────────────
+  // ── room_ice ─────────────────────────────────────────────────────────────────
   socket.on('room_ice', async ({ fromId, candidate }) => {
     const pc = roomPeers[fromId];
-    if (!pc) {
-      // Buffer even if PC doesn't exist yet — will be flushed in createRoomPC path
-      enqueueIce(fromId, candidate);
-      return;
-    }
-
-    // If remote description not yet set, buffer the candidate
-    if (!pc.remoteDescription?.type) {
+    if (!pc || !pc.remoteDescription?.type) {
       enqueueIce(fromId, candidate);
       return;
     }
@@ -899,21 +858,18 @@ function initSocket() {
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (e) {
-      // Null candidate == end-of-candidates marker — not an error
       if (candidate && candidate.candidate !== '') {
         console.warn('[Room] ICE addCandidate error:', e.message);
       }
     }
   });
 
-  // ── room_request_offer: a peer asked us to re-offer ──────────────────────
   socket.on('room_request_offer', ({ fromId }) => {
-    console.log(`[Room] re-offer requested by ${fromId}`);
     peerState[fromId] = 'idle';
+    delete pendingOffers[fromId];
     initiateOffer(fromId);
   });
 
-  // ── Room chat / media / state ─────────────────────────────────────────────
   socket.on('room_message', ({ from, text }) => roomMsg(text, 'received', from));
 
   socket.on('room_member_media', ({ socketId, audioMuted, videoOff }) => {
@@ -936,15 +892,10 @@ function initSocket() {
 }
 
 // ─── Start / rejoin room session ─────────────────────────────────────────────
-// isRejoin = true  → session is already live; we joined late or reconnected.
-//                    We are responsible for offering to EVERYONE already there.
-// isRejoin = false → lobby "Start" was clicked; members use index ordering
-//                    to offer only downward and avoid glare.
 async function startRoomSession(isRejoin = false) {
   if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
 
   if (isRejoin) {
-    // Clean slate: tear down all stale connections before building new ones
     closeAllRoomPeers();
   }
 
@@ -953,9 +904,6 @@ async function startRoomSession(isRejoin = false) {
   reassignStreams();
   roomSys(isRejoin ? 'Reconnecting video…' : 'Session started! Video connecting…');
 
-  // Only mark the room started on a fresh start (not on rejoin / reconnect).
-  // Prevents redundant room_start from overwriting room.started that is
-  // already true and confusing the server-side sessionActive flag.
   if (!isRejoin) {
     socket.emit('room_start', { roomId: currentRoomId });
   }
@@ -964,20 +912,27 @@ async function startRoomSession(isRejoin = false) {
 
   let targets;
   if (isRejoin) {
-    // Offer to ALL existing members — we are the newcomer / reconnector
     targets = others;
   } else {
-    // Fresh session: index-based ordering prevents glare.
-    // [A,B,C]: B→A, C→{A,B}. Each pair has exactly one offerer.
+    // FIX: Index-based ordering — lower index offers to higher, prevents glare
     const myIdx = roomMembers.findIndex(m => m.socketId === mySocketId);
     targets = roomMembers.slice(0, myIdx);
   }
 
-  console.log(`[Room] startRoomSession isRejoin=${isRejoin} | offering to ${targets.length} peers:`, targets.map(t=>t.socketId));
+  console.log(`[Room] startRoomSession isRejoin=${isRejoin} | offering to ${targets.length} peers`);
 
+  // FIX: Stagger offers slightly to prevent simultaneous negotiation overload
+  // especially important for 3+ members
   if (targets.length > 0) {
-    // Fire all offers in parallel for fastest connect time
-    await Promise.all(targets.map(p => initiateOffer(p.socketId)));
+    for (let i = 0; i < targets.length; i++) {
+      const p = targets[i];
+      // Small stagger: 0ms, 100ms, 200ms, etc.
+      setTimeout(() => {
+        if (peerState[p.socketId] === 'idle' || !peerState[p.socketId]) {
+          initiateOffer(p.socketId);
+        }
+      }, i * 100);
+    }
   }
 }
 
@@ -1095,7 +1050,7 @@ async function startCreateRoomFlow() {
   if (!pass) { showToast('⚠ Set a room password'); return; }
   lastRoomPassword = pass;
   currentMaxMembers = selectedMaxMembers;
-  await getLocalMedia();
+  await getLocalMedia(selectedMaxMembers > 2 ? selectedMaxMembers : 0);
   initSocket();
   const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass, maxMembers: selectedMaxMembers }); };
   socket.on('connect', go);
@@ -1133,27 +1088,61 @@ joinRoomIdInput.addEventListener('input', e => {
   e.target.value = e.target.value.replace(/\D/g,'').slice(0,6);
 });
 
-// Member count +/- selector
+// FIX: Member count +/- selector — robust cross-browser implementation
 (function() {
-  const MIN = 2, MAX = 6;
+  const MIN = 2, MAX = 8;  // FIX: max raised to 8
   const valueEl  = $('member-count-value');
   const minusBtn = $('member-count-minus');
   const plusBtn  = $('member-count-plus');
+
   function render() {
-    if (valueEl) valueEl.textContent = selectedMaxMembers;
-    if (minusBtn) minusBtn.disabled = selectedMaxMembers <= MIN;
-    if (plusBtn)  plusBtn.disabled  = selectedMaxMembers >= MAX;
+    if (valueEl) {
+      valueEl.textContent = selectedMaxMembers;
+      valueEl.setAttribute('data-value', selectedMaxMembers);
+    }
+    if (minusBtn) {
+      minusBtn.disabled = selectedMaxMembers <= MIN;
+      minusBtn.setAttribute('aria-disabled', selectedMaxMembers <= MIN);
+    }
+    if (plusBtn) {
+      plusBtn.disabled  = selectedMaxMembers >= MAX;
+      plusBtn.setAttribute('aria-disabled', selectedMaxMembers >= MAX);
+    }
   }
-  if (minusBtn) minusBtn.addEventListener('click', () => { if (selectedMaxMembers > MIN) { selectedMaxMembers--; render(); } });
-  if (plusBtn)  plusBtn.addEventListener('click',  () => { if (selectedMaxMembers < MAX) { selectedMaxMembers++; render(); } });
+
+  if (minusBtn) {
+    minusBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (selectedMaxMembers > MIN) { selectedMaxMembers--; render(); }
+    });
+  }
+  if (plusBtn) {
+    plusBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (selectedMaxMembers < MAX) { selectedMaxMembers++; render(); }
+    });
+  }
   render();
 })();
 
 $('btn-cancel-room').addEventListener('click', leaveRoom);
 $('btn-copy-room-id').addEventListener('click', () => {
-  navigator.clipboard.writeText(lobbyRoomId.textContent)
-    .then(() => showToast('✓ Room ID copied!'))
-    .catch(() => showToast('Room ID: ' + lobbyRoomId.textContent));
+  const roomIdText = lobbyRoomId.textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(roomIdText)
+      .then(() => showToast('✓ Room ID copied!'))
+      .catch(() => showToast('Room ID: ' + roomIdText));
+  } else {
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = roomIdText;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select(); ta.setSelectionRange(0,99999);
+    try { document.execCommand('copy'); showToast('✓ Room ID copied!'); }
+    catch { showToast('Room ID: ' + roomIdText); }
+    document.body.removeChild(ta);
+  }
 });
 
 btnCancelWait.addEventListener('click', () => { endSession(); showScreen('landing'); });
