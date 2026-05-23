@@ -466,7 +466,7 @@ html, body {
 
 /* Video Panel — PERF: contain:paint isolates repaints to this box */
 .video-panel {
-  flex: 4.0; display: flex; flex-direction: row;
+  flex: 3.0; display: flex; flex-direction: row;
   gap: 4px; padding: 8px;
   background: #010608;
   position: relative; min-width: 0;
@@ -730,7 +730,7 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 73vh !important;
+    height: 62vh !important;
     flex-direction: row;
   }
 
@@ -978,7 +978,7 @@ html, body {
 
 /* ─── Room Chat Screen ───────────────────────── */
 .room-video-panel {
-  flex: 4.0;
+  flex: 3.0;
   display: flex;
   position: relative;
   gap: 6px;
@@ -1642,8 +1642,8 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 58vh !important;
-    min-height: 220px;
+    height: 47vh !important;
+    min-height: 180px;
     flex-direction: row !important;
     padding: 4px;
   }
@@ -1729,8 +1729,8 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 58vh !important;
-    min-height: 240px;
+    height: 47vh !important;
+    min-height: 200px;
     padding: 5px;
   }
 
