@@ -421,7 +421,10 @@ html, body {
    CHAT SCREEN
 ══════════════════════════════════════════════════ */
 #screen-chat {
-  background: var(--bg); align-items: stretch; justify-content: stretch;
+  background: var(--bg); align-items: stretch; justify-content: flex-start;
+}
+#screen-room-chat {
+  background: var(--bg); align-items: stretch; justify-content: flex-start;
 }
 .chat-layout {
   width: 100%; height: 100%;
@@ -470,7 +473,7 @@ html, body {
   gap: 4px; padding: 8px;
   background: #010608;
   position: relative; min-width: 0;
-  contain: layout paint;
+  contain: paint;
 }
 .video-box {
   flex: 1; position: relative; overflow: hidden;
@@ -608,6 +611,8 @@ html, body {
   background: var(--panel);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+  position: relative;
+  z-index: 20;
 }
 .ctrl-btn {
   display: flex; flex-direction: column;
@@ -730,13 +735,14 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 54vh !important;
+    height: 42vh !important;
     flex-direction: row;
   }
 
   .msg-panel {
     flex: 1; max-width: 100%;
     border-left: none; border-top: 1px solid var(--border);
+    min-height: 0;
   }
 
   .controls-bar { gap: 5px; padding: 8px 10px; }
@@ -984,7 +990,7 @@ html, body {
   gap: 6px;
   min-height: 0;
   overflow: hidden;
-  contain: layout paint;
+  contain: paint;
 }
 
 .room-video-panel.layout-split { flex-direction: row; }
