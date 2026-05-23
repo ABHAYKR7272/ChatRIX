@@ -11,18 +11,25 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 
-  // Render: always start with polling so the HTTP upgrade can complete
-  transports: ['polling', 'websocket'],
+  // PERF: websocket first, polling as fallback only
+  transports: ['websocket', 'polling'],
+  upgrade: true,
 
-  // Generous timeouts for Render's cold-start / sleep behaviour
-  pingTimeout:  30000,
-  pingInterval: 10000,
+  // Tighter timeouts for faster disconnect detection
+  pingTimeout:  20000,
+  pingInterval:  8000,
 
-  // Allow reasonably-large signaling payloads (SDP can be ~8 KB each)
-  maxHttpBufferSize: 128 * 1024,   // 128 KB
+  // Allow reasonably-large signaling payloads (SDP ~8 KB each)
+  maxHttpBufferSize: 256 * 1024,   // 256 KB
 
   httpCompression: true,
-  perMessageDeflate: { threshold: 512, zlibDeflateOptions: { level: 1 } },
+  perMessageDeflate: { threshold: 256, zlibDeflateOptions: { level: 1 } },
+
+  // PERF: connection state recovery
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true,
+  },
 });
 
 // ─── Static files ────────────────────────────────────────────────────────────
@@ -38,13 +45,13 @@ const activePairs  = new Map();          // socketId → partnerId
 const userNames    = new Map();          // socketId → name
 const onlineCount  = { value: 0 };
 
-// roomId → { password, host, members:[{socketId,name}], started:bool }
+// roomId → { password, host, members:[{socketId,name}], started:bool, maxMembers:n, joinedIds:Set }
 const rooms      = new Map();
 const roomTimers = new Map();
 
 // Rate limiting — per-socket message counter
 const msgRateMap    = new Map();
-const MSG_RATE_LIMIT  = 8;
+const MSG_RATE_LIMIT  = 12;   // slightly relaxed for better UX
 const MSG_RATE_WINDOW = 2000;
 
 function isRateLimited(socketId) {
@@ -64,14 +71,14 @@ function generateRoomId() {
   return id;
 }
 
-// Throttled online-count broadcast (max once per 500 ms)
+// Throttled online-count broadcast (max once per 300 ms)
 let bcTimer = null;
 function broadcastOnlineCount() {
   if (bcTimer) return;
   bcTimer = setTimeout(() => {
     io.emit('online_count', onlineCount.value);
     bcTimer = null;
-  }, 500);
+  }, 300);
 }
 
 function tryMatch() {
@@ -99,7 +106,6 @@ io.on('connection', (socket) => {
   broadcastOnlineCount();
   console.log(`[CONNECT] ${socket.id} | online=${onlineCount.value} transport=${socket.conn.transport.name}`);
 
-  // Log transport upgrades (polling → websocket)
   socket.conn.on('upgrade', (t) =>
     console.log(`[UPGRADE] ${socket.id} → ${t.name}`));
 
@@ -118,7 +124,7 @@ io.on('connection', (socket) => {
   socket.on('create_room', ({ name, password, maxMembers }) => {
     const safeName   = String(name || '').trim().slice(0, 24) || 'Host';
     const safePass   = String(password || '').trim().slice(0, 32);
-    const safeMax    = Math.min(6, Math.max(2, parseInt(maxMembers, 10) || 2));
+    const safeMax    = Math.min(8, Math.max(2, parseInt(maxMembers, 10) || 2));
     const roomId     = generateRoomId();
     userNames.set(socket.id, safeName);
     rooms.set(roomId, {
@@ -127,7 +133,6 @@ io.on('connection', (socket) => {
       maxMembers: safeMax,
       members:    [{ socketId: socket.id, name: safeName }],
       started:    false,
-      // Track all socket IDs that ever joined — for rejoin blocking
       joinedIds:  new Set([socket.id]),
     });
     socket.join(roomId);
@@ -148,11 +153,10 @@ io.on('connection', (socket) => {
     if (room.password !== String(password || '').trim())
                 { socket.emit('room_error', { msg: 'Wrong password' }); return; }
 
-    // Block rejoin: if session is already started and this socket ID isn't
-    // a reconnection of an existing member, deny entry.
     const isExistingMember = room.members.some(m => m.socketId === socket.id);
     const wasEverMember    = room.joinedIds && room.joinedIds.has(socket.id);
 
+    // FIX: After session started, only block truly new people (not reconnects)
     if (room.started && !isExistingMember && !wasEverMember) {
       socket.emit('room_error', {
         msg: 'Session already started — this room is closed to new members.',
@@ -161,19 +165,19 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (!room.started && room.members.length >= room.maxMembers && !isExistingMember) {
+    // FIX: Full room check only for truly new joiners
+    if (!room.started && !isExistingMember && room.members.length >= room.maxMembers) {
       socket.emit('room_error', { msg: `Room is full (max ${room.maxMembers})` });
       return;
     }
 
-    // Clear any pending close timer (rejoin within 30 s)
+    // Clear any pending close timer (rejoin within grace period)
     if (roomTimers.has(roomId)) {
       clearTimeout(roomTimers.get(roomId));
       roomTimers.delete(roomId);
     }
 
-    // If this socket is already in the member list (fast reconnect / duplicate join),
-    // remove the stale entry so we get a clean slot.
+    // Remove stale entry for this socket if exists
     const staleIdx = room.members.findIndex(m => m.socketId === socket.id);
     if (staleIdx !== -1) room.members.splice(staleIdx, 1);
 
@@ -189,7 +193,6 @@ io.on('connection', (socket) => {
       started:    room.started,
     });
 
-    // Tell others: new member arrived
     socket.to(roomId).emit('room_member_joined', {
       socketId:      socket.id,
       name:          safeName,
@@ -200,41 +203,37 @@ io.on('connection', (socket) => {
 
     console.log(`[ROOM] ${safeName}(${socket.id}) joined ${roomId} | members=${room.members.length}/${room.maxMembers} started=${room.started}`);
 
-    // ── Auto-start when all expected members are present ─────────────────────
-    if (!room.started && room.members.length === room.maxMembers) {
+    // Auto-start when all expected members are present
+    if (!room.started && room.members.length >= room.maxMembers) {
       room.started = true;
       console.log(`[ROOM] ${roomId} auto-starting — all ${room.maxMembers} members present`);
-      io.to(roomId).emit('room_auto_start', {
-        members:    room.members,
-        maxMembers: room.maxMembers,
-      });
+      // Small delay to let all clients settle their socket state
+      setTimeout(() => {
+        io.to(roomId).emit('room_auto_start', {
+          members:    room.members,
+          maxMembers: room.maxMembers,
+        });
+      }, 200);
     }
   });
 
   // ── Room: Mark session started ─────────────────────────────────────────────
-  // Only the host calls this on the very first "Start" click; rejoining users
-  // never emit room_start — the server uses room.started to gate this.
   socket.on('room_start', ({ roomId }) => {
     const room = rooms.get(roomId);
-    if (!room) return;
-    // Prevent duplicate marking from reconnects
-    if (!room.started) {
-      room.started = true;
-      console.log(`[ROOM] ${roomId} marked as started`);
-    }
+    if (!room || room.started) return;
+    room.started = true;
+    console.log(`[ROOM] ${roomId} marked as started`);
   });
 
   // ── Room: WebRTC mesh signaling ─────────────────────────────────────────────
   socket.on('room_offer', ({ targetId, offer }) => {
     if (!offer || !targetId) return;
     io.to(targetId).emit('room_offer', { fromId: socket.id, offer });
-    console.log(`[SIG] offer ${socket.id} → ${targetId}`);
   });
 
   socket.on('room_answer', ({ targetId, answer }) => {
     if (!answer || !targetId) return;
     io.to(targetId).emit('room_answer', { fromId: socket.id, answer });
-    console.log(`[SIG] answer ${socket.id} → ${targetId}`);
   });
 
   socket.on('room_ice', ({ targetId, candidate }) => {
@@ -242,11 +241,9 @@ io.on('connection', (socket) => {
     io.to(targetId).emit('room_ice', { fromId: socket.id, candidate });
   });
 
-  // ── Room: Request re-offer (peer asks us to re-offer after reconnect) ───────
   socket.on('room_request_offer', ({ targetId }) => {
     if (!targetId) return;
     io.to(targetId).emit('room_request_offer', { fromId: socket.id });
-    console.log(`[SIG] re-offer request: ${socket.id} → ${targetId}`);
   });
 
   // ── Room: Chat (rate-limited) ───────────────────────────────────────────────
@@ -341,7 +338,9 @@ function handleRoomLeave(socket) {
         socketId: socket.id, name: leftName, members: room.members,
       });
 
-      if (room.members.length === 1) {
+      // FIX: Only start close timer if 1 member AND session was started
+      // If not started yet, keep room alive so others can still join
+      if (room.members.length === 1 && room.started) {
         if (roomTimers.has(roomId)) clearTimeout(roomTimers.get(roomId));
         const timer = setTimeout(() => {
           const r = rooms.get(roomId);
