@@ -42,6 +42,7 @@ let isCamOff       = false;
 let currentRoomId    = null;
 let lastRoomPassword = '';
 let roomMembers      = [];
+let currentMaxMembers = 2;
 let mySocketId       = null;
 let focusedPeerId    = null;
 let roomMuted        = false;
@@ -107,7 +108,10 @@ const joinPassInput      = $('join-pass-input');
 const lobbyRoomId        = $('lobby-room-id');
 const lobbyMembersList   = $('lobby-members-list');
 const lobbyMemberCount   = $('lobby-member-count');
-const btnStartRoom       = $('btn-start-room');
+const lobbyMaxCount      = $('lobby-max-count');
+const lobbyStatusText    = $('lobby-status-text');
+const lobbyAutostartFill = $('lobby-autostart-fill');
+const lobbyAutostartHint = $('lobby-autostart-hint');
 const roomVideoPanel     = $('room-video-panel');
 const roomMsgContainer   = $('room-messages-container');
 const roomChatInput      = $('room-chat-input');
@@ -117,6 +121,9 @@ const roomMemberCountEl  = $('room-member-count-display');
 const btnRoomMute        = $('btn-room-mute');
 const btnRoomCam         = $('btn-room-cam');
 const btnRoomLeave       = $('btn-room-leave');
+
+// Member count selector (create room screen)
+let selectedMaxMembers = 2;
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 function showScreen(name) {
@@ -593,9 +600,26 @@ function sendRoomMsg() {
 }
 
 // ─── Lobby ───────────────────────────────────────────────────────────────────
-function updateLobby(members) {
+function updateLobby(members, maxMembers) {
   roomMembers = members;
+  if (maxMembers !== undefined) currentMaxMembers = maxMembers;
+  const max = currentMaxMembers || 2;
+
   lobbyMemberCount.textContent = members.length;
+  if (lobbyMaxCount) lobbyMaxCount.textContent = max;
+
+  // Progress bar
+  const pct = Math.min(100, Math.round((members.length / max) * 100));
+  if (lobbyAutostartFill) lobbyAutostartFill.style.width = pct + '%';
+
+  // Status text
+  const remaining = max - members.length;
+  if (lobbyStatusText) {
+    lobbyStatusText.textContent = remaining > 0
+      ? `WAITING FOR ${remaining} MORE MEMBER${remaining !== 1 ? 'S' : ''}`
+      : 'ALL MEMBERS PRESENT — STARTING…';
+  }
+
   const frag = document.createDocumentFragment();
   members.forEach(m => {
     const p = el('div','member-pill');
@@ -608,6 +632,7 @@ function updateLobby(members) {
 function updateMemberCount() {
   if (roomMemberCountEl) roomMemberCountEl.textContent = roomMembers.length;
   if (lobbyMemberCount)  lobbyMemberCount.textContent  = roomMembers.length;
+  if (lobbyMaxCount)     lobbyMaxCount.textContent     = currentMaxMembers || 2;
 }
 
 // ─── Socket initialisation ───────────────────────────────────────────────────
@@ -705,28 +730,45 @@ function initSocket() {
   socket.on('partner_left', () => { closePeerConnection(); addSys('Stranger disconnected.'); showModal(); });
 
   // ══ Room events ════════════════════════════════════════════════════════════
-  socket.on('room_created', ({ roomId, name, members }) => {
+  socket.on('room_created', ({ roomId, name, members, maxMembers }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
-    lobbyRoomId.textContent = roomId; updateLobby(members);
+    currentMaxMembers = maxMembers || 2;
+    lobbyRoomId.textContent = roomId; updateLobby(members, maxMembers);
     showScreen('roomLobby'); showToast(`✓ Room ${roomId} created!`);
   });
 
-  socket.on('room_joined', ({ roomId, name, members, started }) => {
+  socket.on('room_joined', ({ roomId, name, members, maxMembers, started }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
+    currentMaxMembers = maxMembers || currentMaxMembers;
     mySocketId    = socket.id;
     lobbyRoomId.textContent = roomId;
     if (started) {
+      // Session already started — this is a reconnect flow
       showToast('✓ Rejoined — reconnecting video…');
       startRoomSession(true);   // rejoin path → send offers to everyone
     } else {
-      updateLobby(members); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
+      updateLobby(members, maxMembers); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
     }
   });
 
-  socket.on('room_error', ({ msg }) => showToast('⚠ ' + msg, 3500));
+  socket.on('room_error', ({ msg, code }) => {
+    if (code === 'SESSION_STARTED') {
+      showToast('⛔ Session already started — you cannot rejoin this room.', 5000);
+    } else {
+      showToast('⚠ ' + msg, 3500);
+    }
+  });
 
-  socket.on('room_member_joined', ({ socketId, name, members, sessionActive }) => {
-    roomMembers = members; updateLobby(members); updateMemberCount();
+  // ── Auto-start: server triggers when all expected members have joined ───────
+  socket.on('room_auto_start', ({ members, maxMembers }) => {
+    roomMembers = members; currentMaxMembers = maxMembers;
+    updateLobby(members, maxMembers);
+    // Brief visual pause so users see the "ALL MEMBERS PRESENT" state
+    setTimeout(() => startRoomSession(false), 800);
+  });
+
+  socket.on('room_member_joined', ({ socketId, name, members, maxMembers, sessionActive }) => {
+    roomMembers = members; updateLobby(members, maxMembers); updateMemberCount();
     roomSys(`${name} joined`); showToast(`🟢 ${name} joined`);
 
     if (sessionActive && screens.roomChat.classList.contains('active')) {
@@ -946,6 +988,7 @@ function cleanupRoom() {
   currentRoomId    = null;
   lastRoomPassword = '';
   roomMembers      = [];
+  currentMaxMembers = 2;
   focusedPeerId    = null;
   roomMuted        = false;
   roomCamOff       = false;
@@ -1051,9 +1094,10 @@ async function startCreateRoomFlow() {
   const pass = createPassInput.value.trim();
   if (!pass) { showToast('⚠ Set a room password'); return; }
   lastRoomPassword = pass;
+  currentMaxMembers = selectedMaxMembers;
   await getLocalMedia();
   initSocket();
-  const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass }); };
+  const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass, maxMembers: selectedMaxMembers }); };
   socket.on('connect', go);
   if (socket.connected) go();
 }
@@ -1089,7 +1133,22 @@ joinRoomIdInput.addEventListener('input', e => {
   e.target.value = e.target.value.replace(/\D/g,'').slice(0,6);
 });
 
-btnStartRoom.addEventListener('click',   () => startRoomSession(false));
+// Member count +/- selector
+(function() {
+  const MIN = 2, MAX = 6;
+  const valueEl  = $('member-count-value');
+  const minusBtn = $('member-count-minus');
+  const plusBtn  = $('member-count-plus');
+  function render() {
+    if (valueEl) valueEl.textContent = selectedMaxMembers;
+    if (minusBtn) minusBtn.disabled = selectedMaxMembers <= MIN;
+    if (plusBtn)  plusBtn.disabled  = selectedMaxMembers >= MAX;
+  }
+  if (minusBtn) minusBtn.addEventListener('click', () => { if (selectedMaxMembers > MIN) { selectedMaxMembers--; render(); } });
+  if (plusBtn)  plusBtn.addEventListener('click',  () => { if (selectedMaxMembers < MAX) { selectedMaxMembers++; render(); } });
+  render();
+})();
+
 $('btn-cancel-room').addEventListener('click', leaveRoom);
 $('btn-copy-room-id').addEventListener('click', () => {
   navigator.clipboard.writeText(lobbyRoomId.textContent)
