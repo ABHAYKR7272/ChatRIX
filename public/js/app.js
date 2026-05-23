@@ -771,6 +771,21 @@ function initSocket() {
     // Update stranger panel label
     const lbl = $('stranger-big-label');
     if (lbl) lbl.textContent = partnerName.toUpperCase();
+
+    // Re-attach local video if stream exists (important after skip)
+    if (localStream && localVideo) {
+      localVideo.srcObject = localStream;
+      localVideo.muted = true;
+    }
+
+    // Reset remote video state
+    const remVid = $('remoteVideo');
+    if (remVid) { remVid.style.opacity = '1'; remVid.srcObject = null; }
+    if (remoteStatus) {
+      remoteStatus.textContent = 'Connecting…';
+      remoteStatus.classList.remove('hidden');
+    }
+
     clearMsgs(); addSys(`Connected to ${partnerName}. Say hello!`);
     showScreen('chat');
     initStrangerPanel();
@@ -801,7 +816,14 @@ function initSocket() {
   });
 
   socket.on('chat_message', ({ from, text }) => addMsg(text, 'received', from));
-  socket.on('partner_left', () => { closePeerConnection(); addSys('Stranger disconnected.'); showModal(); });
+  socket.on('partner_left', () => {
+    closePeerConnection();
+    addSys('Stranger disconnected.');
+    // Reset remote video
+    const remVid = $('remoteVideo');
+    if (remVid) { remVid.style.opacity = '1'; }
+    showModal();
+  });
 
   // ══ Room events ════════════════════════════════════════════════════════════
   socket.on('room_created', ({ roomId, name, members }) => {
@@ -1030,29 +1052,72 @@ function hideModal() { if (modalLeft) modalLeft.style.display = 'none'; }
 
 // ─── Stranger controls ───────────────────────────────────────────────────────
 function toggleMute() {
+  if (!localStream) { showToast('⚠ No microphone available'); return; }
   isMuted = !isMuted;
-  localStream?.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
+  localStream.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
   btnMute.classList.toggle('active', isMuted);
   btnMute.querySelector('.icon-unmuted').style.display = isMuted ? 'none' : 'block';
   btnMute.querySelector('.icon-muted').style.display   = isMuted ? 'block' : 'none';
   showToast(isMuted ? '🎤 Muted' : '🎤 Mic on');
 }
 function toggleCamera() {
+  if (!localStream) { showToast('⚠ No camera available'); return; }
   isCamOff = !isCamOff;
-  localStream?.getVideoTracks().forEach(t => { t.enabled = !isCamOff; });
+  localStream.getVideoTracks().forEach(t => { t.enabled = !isCamOff; });
   btnVideoToggle.classList.toggle('active', isCamOff);
   btnVideoToggle.querySelector('.icon-cam-on').style.display  = isCamOff ? 'none' : 'block';
   btnVideoToggle.querySelector('.icon-cam-off').style.display = isCamOff ? 'block' : 'none';
   showToast(isCamOff ? '📷 Camera off' : '📷 Camera on');
 }
 function skipStranger() {
-  closePeerConnection(); addSys('Searching for next stranger…');
-  strangerFullscreen = null; strangerRemoteAudioMuted = false; strangerRemoteVideoHidden = false;
+  closePeerConnection();
+
+  // Reset all stranger-mode state
+  strangerFullscreen = null;
+  strangerRemoteAudioMuted = false;
+  strangerRemoteVideoHidden = false;
+
+  // Reset video panel classes
   const panelEl = $('video-panel-stranger');
   if (panelEl) panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+
+  // Reset remote video opacity
   const remVid = $('remoteVideo');
-  if (remVid) remVid.style.opacity = '1';
-  socket.emit('skip'); showScreen('waiting');
+  if (remVid) { remVid.style.opacity = '1'; remVid.srcObject = null; }
+
+  // Reset mute/cam state and UI buttons
+  isMuted = false; isCamOff = false;
+  if (localStream) {
+    localStream.getAudioTracks().forEach(t => { t.enabled = true; });
+    localStream.getVideoTracks().forEach(t => { t.enabled = true; });
+  }
+  if (btnMute) {
+    btnMute.classList.remove('active');
+    const u = btnMute.querySelector('.icon-unmuted');
+    const m = btnMute.querySelector('.icon-muted');
+    if (u) u.style.display = 'block';
+    if (m) m.style.display = 'none';
+  }
+  if (btnVideoToggle) {
+    btnVideoToggle.classList.remove('active');
+    const on  = btnVideoToggle.querySelector('.icon-cam-on');
+    const off = btnVideoToggle.querySelector('.icon-cam-off');
+    if (on)  on.style.display  = 'block';
+    if (off) off.style.display = 'none';
+  }
+
+  // Ensure local video is still showing (stream may still be live)
+  if (localStream && localVideo) localVideo.srcObject = localStream;
+
+  // Reset remote status overlay
+  if (remoteStatus) {
+    remoteStatus.textContent = 'Connecting…';
+    remoteStatus.classList.remove('hidden');
+  }
+
+  addSys('Searching for next stranger…');
+  socket.emit('skip');
+  showScreen('waiting');
 }
 function endSession() {
   closePeerConnection(); stopLocalMedia();
@@ -1072,8 +1137,9 @@ function endSession() {
 
 // ─── Room controls ────────────────────────────────────────────────────────────
 function toggleRoomMute() {
+  if (!localStream) { showToast('⚠ No microphone available'); return; }
   roomMuted = !roomMuted;
-  localStream?.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
+  localStream.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
   btnRoomMute.classList.toggle('active', roomMuted);
   btnRoomMute.querySelector('.icon-unmuted').style.display = roomMuted ? 'none' : 'block';
   btnRoomMute.querySelector('.icon-muted').style.display   = roomMuted ? 'block' : 'none';
@@ -1081,8 +1147,9 @@ function toggleRoomMute() {
   showToast(roomMuted ? '🎤 Muted' : '🎤 Mic on');
 }
 function toggleRoomCam() {
+  if (!localStream) { showToast('⚠ No camera available'); return; }
   roomCamOff = !roomCamOff;
-  localStream?.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
+  localStream.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
   btnRoomCam.classList.toggle('active', roomCamOff);
   btnRoomCam.querySelector('.icon-cam-on').style.display  = roomCamOff ? 'none' : 'block';
   btnRoomCam.querySelector('.icon-cam-off').style.display = roomCamOff ? 'block' : 'none';
