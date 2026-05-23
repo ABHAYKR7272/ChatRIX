@@ -6,17 +6,33 @@ const path = require('path');
 const app = express();
 const server = http.createServer(app);
 
+// ─── Socket.IO — optimized config ────────────────────────────────────────────
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
+
+  // Faster dead-connection detection (was 60000/25000)
   pingTimeout:  20000,
   pingInterval:  8000,
+
+  // Prefer WebSocket, fall back to polling only if needed
   transports: ['websocket', 'polling'],
+
+  // Compress payloads → less bandwidth on slow connections
   httpCompression: true,
-  maxHttpBufferSize: 64 * 1024,
+  perMessageDeflate: {
+    threshold: 256,         // compress anything > 256 bytes
+    zlibDeflateOptions: { level: 1 },  // fast compression (level 1 = best speed)
+  },
+
+  // Reject oversized payloads (prevents memory abuse with many users)
+  maxHttpBufferSize: 64 * 1024,  // 64 KB max per message
 });
 
+// ─── Static files with caching headers ───────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public'), {
-  maxAge: '1d', etag: true, lastModified: true,
+  maxAge: '1d',          // browsers cache JS/CSS for 1 day
+  etag: true,
+  lastModified: true,
 }));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
@@ -26,14 +42,14 @@ const activePairs  = new Map();
 const userNames    = new Map();
 const onlineCount  = { value: 0 };
 
-// Room: roomId → { password, host, members:[{socketId,name}], started:bool }
+// Room state: roomId → { password, host, members:[{socketId,name}], started:bool }
 const rooms      = new Map();
 const roomTimers = new Map();
 
-// Rate limiting
+// Per-socket rate limiting: socketId → { count, resetAt }
 const msgRateMap = new Map();
-const MSG_RATE_LIMIT = 8;
-const MSG_RATE_WINDOW = 2000;
+const MSG_RATE_LIMIT = 8;     // max messages per window
+const MSG_RATE_WINDOW = 2000; // per 2 seconds
 
 function isRateLimited(socketId) {
   const now = Date.now();
@@ -54,6 +70,7 @@ function generateRoomId() {
   return id;
 }
 
+// ─── Throttled online-count broadcast (max once per 500 ms) ──────────────────
 let broadcastTimer = null;
 function broadcastOnlineCount() {
   if (broadcastTimer) return;
@@ -78,25 +95,17 @@ function tryMatch() {
     activePairs.set(userB.socketId, userA.socketId);
     socketA.emit('matched', { partnerName: userB.name, initiator: true });
     socketB.emit('matched', { partnerName: userA.name, initiator: false });
+    console.log(`[MATCH] ${userA.name} ↔ ${userB.name}`);
   }
-}
-
-// ─── Helper: tell two peers to connect ───────────────────────────────────────
-// initiatorId sends the offer, receiverId waits
-function pairPeers(initiatorId, receiverId) {
-  const sI = io.sockets.sockets.get(initiatorId);
-  const sR = io.sockets.sockets.get(receiverId);
-  if (sI) sI.emit('rtc_connect', { peerId: receiverId, initiator: true });
-  if (sR) sR.emit('rtc_connect', { peerId: initiatorId, initiator: false });
-  console.log(`[RTC] pair: ${initiatorId}(offer) → ${receiverId}(answer)`);
 }
 
 // ─── Socket Events ───────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   onlineCount.value++;
   broadcastOnlineCount();
+  console.log(`[CONNECT] ${socket.id} | Online: ${onlineCount.value}`);
 
-  // ── Stranger mode ──────────────────────────────────────────────────────────
+  // ── Stranger mode ──
   socket.on('join_queue', ({ name }) => {
     const safeName = String(name).trim().slice(0, 24) || 'Stranger';
     userNames.set(socket.id, safeName);
@@ -107,7 +116,7 @@ io.on('connection', (socket) => {
     tryMatch();
   });
 
-  // ── Room: Create ───────────────────────────────────────────────────────────
+  // ── Room: Create ──
   socket.on('create_room', ({ name, password }) => {
     const safeName = String(name).trim().slice(0, 24) || 'Host';
     const safePass = String(password).trim().slice(0, 32);
@@ -120,21 +129,26 @@ io.on('connection', (socket) => {
       started: false
     });
     socket.join(roomId);
-    socket.emit('room_created', { roomId, name: safeName, members: [{ socketId: socket.id, name: safeName }] });
+    socket.emit('room_created', {
+      roomId,
+      name: safeName,
+      members: [{ socketId: socket.id, name: safeName }]
+    });
     console.log(`[ROOM] Created ${roomId} by ${safeName}`);
   });
 
-  // ── Room: Join ─────────────────────────────────────────────────────────────
+  // ── Room: Start ──
+  socket.on('room_start', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (room) { room.started = true; console.log(`[ROOM] ${roomId} session started`); }
+  });
+
+  // ── Room: Join ──
   socket.on('join_room', ({ roomId, password, name }) => {
     const safeName = String(name).trim().slice(0, 24) || 'User';
     const room = rooms.get(roomId);
     if (!room) { socket.emit('room_error', { msg: 'Room not found or expired' }); return; }
     if (room.password !== String(password).trim()) { socket.emit('room_error', { msg: 'Wrong password' }); return; }
-
-    // Remove stale entry for same name (disconnected socket)
-    const staleIdx = room.members.findIndex(m => m.name === safeName && !io.sockets.sockets.get(m.socketId));
-    if (staleIdx !== -1) room.members.splice(staleIdx, 1);
-
     if (room.members.length >= 6) { socket.emit('room_error', { msg: 'Room is full (max 6)' }); return; }
 
     if (roomTimers.has(roomId)) {
@@ -146,95 +160,68 @@ io.on('connection', (socket) => {
     room.members.push({ socketId: socket.id, name: safeName });
     socket.join(roomId);
 
-    // Send joiner their info + current state
-    socket.emit('room_joined', {
-      roomId,
-      name: safeName,
-      members: room.members,
-      started: room.started
-    });
-
-    // Tell existing members someone joined
+    socket.emit('room_joined', { roomId, name: safeName, members: room.members, started: room.started });
     socket.to(roomId).emit('room_member_joined', {
-      socketId: socket.id,
-      name: safeName,
-      members: room.members,
-      sessionActive: room.started
+      socketId: socket.id, name: safeName, members: room.members, sessionActive: room.started
     });
-
-    console.log(`[ROOM] ${safeName}(${socket.id}) joined ${roomId} | Members: ${room.members.length} | Started: ${room.started}`);
-
-    // ── KEY FIX: if session already running, server pairs the new joiner
-    //    with every existing member RIGHT NOW from server side
-    //    No client timing issue possible
-    if (room.started) {
-      const existingMembers = room.members.filter(m => m.socketId !== socket.id);
-      existingMembers.forEach(m => {
-        // New joiner is always receiver; existing member is initiator
-        // (existing member already has media ready, new joiner may still be loading)
-        pairPeers(m.socketId, socket.id);
-      });
-    }
+    console.log(`[ROOM] ${safeName} joined ${roomId} | Members: ${room.members.length}`);
   });
 
-  // ── Room: Start session ────────────────────────────────────────────────────
-  socket.on('room_start', ({ roomId }) => {
-    const room = rooms.get(roomId);
-    if (!room) return;
-    room.started = true;
-    console.log(`[ROOM] ${roomId} session started`);
-
-    // Tell ALL members (including host) to enter video screen
-    io.to(roomId).emit('room_session_started', { members: room.members });
-
-    // Server pairs every combination — no client has to figure out who initiates
-    const members = room.members;
-    for (let i = 0; i < members.length; i++) {
-      for (let j = i + 1; j < members.length; j++) {
-        // member[i] is initiator (sends offer), member[j] is receiver
-        pairPeers(members[i].socketId, members[j].socketId);
-      }
-    }
+  // ── Room: WebRTC mesh signaling ──
+  socket.on('room_offer', ({ targetId, offer }) => {
+    io.to(targetId).emit('room_offer', { fromId: socket.id, offer });
+  });
+  socket.on('room_answer', ({ targetId, answer }) => {
+    io.to(targetId).emit('room_answer', { fromId: socket.id, answer });
+  });
+  socket.on('room_ice', ({ targetId, candidate }) => {
+    io.to(targetId).emit('room_ice', { fromId: socket.id, candidate });
   });
 
-  // ── Room: WebRTC signaling (pure relay) ───────────────────────────────────
-  socket.on('room_offer',  ({ targetId, offer })     => io.to(targetId).emit('room_offer',  { fromId: socket.id, offer }));
-  socket.on('room_answer', ({ targetId, answer })    => io.to(targetId).emit('room_answer', { fromId: socket.id, answer }));
-  socket.on('room_ice',    ({ targetId, candidate }) => io.to(targetId).emit('room_ice',    { fromId: socket.id, candidate }));
-
-  // ── Room: Chat ────────────────────────────────────────────────────────────
+  // ── Room: Chat (rate-limited) ──
   socket.on('room_message', ({ roomId, text }) => {
-    if (isRateLimited(socket.id)) return;
+    if (isRateLimited(socket.id)) return;   // silently drop spam
     const name = userNames.get(socket.id) || 'User';
     if (text && String(text).trim().length > 0) {
-      socket.to(roomId).emit('room_message', { from: name, text: String(text).trim().slice(0, 500), timestamp: Date.now() });
+      const safeText = String(text).trim().slice(0, 500);
+      socket.to(roomId).emit('room_message', { from: name, text: safeText, timestamp: Date.now() });
     }
   });
 
-  // ── Room: Force mute ─────────────────────────────────────────────────────
+  // ── Room: Force mute/unmute ──
   socket.on('room_force_mute', ({ roomId, targetId, muted }) => {
     const byName = userNames.get(socket.id) || 'Someone';
     io.to(targetId).emit('room_force_muted', { byName, muted });
     socket.to(roomId).emit('room_member_media', { socketId: targetId, audioMuted: muted, videoOff: false });
   });
 
-  // ── Room: Media state ────────────────────────────────────────────────────
+  // ── Room: Media state ──
   socket.on('room_media_state', ({ roomId, audioMuted, videoOff }) => {
     socket.to(roomId).emit('room_member_media', { socketId: socket.id, audioMuted, videoOff });
   });
 
-  // ── Stranger WebRTC relay ─────────────────────────────────────────────────
-  socket.on('webrtc_offer',  ({ offer })     => { const p = activePairs.get(socket.id); if (p) io.to(p).emit('webrtc_offer',  { offer }); });
-  socket.on('webrtc_answer', ({ answer })    => { const p = activePairs.get(socket.id); if (p) io.to(p).emit('webrtc_answer', { answer }); });
-  socket.on('webrtc_ice',    ({ candidate }) => { const p = activePairs.get(socket.id); if (p) io.to(p).emit('webrtc_ice',    { candidate }); });
+  // ── Stranger WebRTC ──
+  socket.on('webrtc_offer', ({ offer }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (partnerId) io.to(partnerId).emit('webrtc_offer', { offer });
+  });
+  socket.on('webrtc_answer', ({ answer }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (partnerId) io.to(partnerId).emit('webrtc_answer', { answer });
+  });
+  socket.on('webrtc_ice', ({ candidate }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (partnerId) io.to(partnerId).emit('webrtc_ice', { candidate });
+  });
 
-  // ── Stranger Chat ─────────────────────────────────────────────────────────
+  // ── Stranger Chat (rate-limited) ──
   socket.on('chat_message', ({ text }) => {
     if (isRateLimited(socket.id)) return;
     const partnerId = activePairs.get(socket.id);
     const senderName = userNames.get(socket.id) || 'Stranger';
     if (partnerId && text && String(text).trim().length > 0) {
-      io.to(partnerId).emit('chat_message', { from: senderName, text: String(text).trim().slice(0, 500), timestamp: Date.now() });
+      const safeText = String(text).trim().slice(0, 500);
+      io.to(partnerId).emit('chat_message', { from: senderName, text: safeText, timestamp: Date.now() });
     }
   });
 
@@ -247,6 +234,7 @@ io.on('connection', (socket) => {
     handleRoomLeave(socket);
     userNames.delete(socket.id);
     msgRateMap.delete(socket.id);
+    console.log(`[DISCONNECT] ${socket.id} | Online: ${onlineCount.value}`);
   });
 });
 
@@ -277,15 +265,19 @@ function handleRoomLeave(socket) {
       if (room.members.length === 0) {
         if (roomTimers.has(roomId)) { clearTimeout(roomTimers.get(roomId)); roomTimers.delete(roomId); }
         rooms.delete(roomId);
+        console.log(`[ROOM] ${roomId} deleted (empty)`);
       } else {
         if (room.host === socket.id) room.host = room.members[0].socketId;
         io.to(roomId).emit('room_member_left', { socketId: socket.id, name: leftName, members: room.members });
+
         if (room.members.length === 1) {
           if (roomTimers.has(roomId)) clearTimeout(roomTimers.get(roomId));
           const timer = setTimeout(() => {
             const r = rooms.get(roomId);
             if (r && r.members.length <= 1) {
-              if (r.members.length === 1) io.to(r.members[0].socketId).emit('room_closed', { msg: 'Room closed — you were alone for 30 seconds.' });
+              if (r.members.length === 1) {
+                io.to(r.members[0].socketId).emit('room_closed', { msg: 'Room closed — you were alone for 30 seconds.' });
+              }
               rooms.delete(roomId);
               roomTimers.delete(roomId);
             }
