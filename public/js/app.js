@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   CHAT-RIX  —  app.js  (SUPER FAST + ALL BUGS FIXED)
+   CHAT-RIX  —  app.js  v2.0  (2-Person Rooms, Fast, Smooth)
    ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -25,7 +25,7 @@ const ICE_CFG = {
       credential: 'openrelayproject',
     },
   ],
-  iceCandidatePoolSize: 4,       // PERF: reduced from 8
+  iceCandidatePoolSize: 4,
   bundlePolicy:  'max-bundle',
   rtcpMuxPolicy: 'require',
 };
@@ -42,33 +42,20 @@ let isCamOff       = false;
 let currentRoomId    = null;
 let lastRoomPassword = '';
 let roomMembers      = [];
-let currentMaxMembers = 2;
 let mySocketId       = null;
-let focusedPeerId    = null;
 let roomMuted        = false;
 let roomCamOff       = false;
+let isVideoSwapped   = false;  // double-click swap state
 
-// roomPeers[peerId]  → RTCPeerConnection
-// roomStreams[peerId] → MediaStream
-// iceQueue[peerId]   → RTCIceCandidateInit[]
-// peerState[peerId]  → 'idle'|'offering'|'answering'
-// offerRetries[peerId] → number
+// Room peer (only 1 peer in 2-person room)
 const roomPeers    = {};
 const roomStreams   = {};
 const iceQueue     = {};
 const peerState    = {};
 const offerRetries = {};
-const silenceState     = {};
-const remoteAudioMuted = {};
-const remoteVideoOff   = {};
-
-// FIX: Prevent multiple simultaneous offer initiations to same peer
 const pendingOffers = {};
 
 let rebuildTimer = null;
-let roomStartTimer = null;
-let roomSessionStarted = false;
-let roomSessionStarting = false;
 
 // ─── DOM shortcuts ───────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -82,6 +69,7 @@ const screens = {
   roomLobby:    $('screen-room-lobby'),
   chat:         $('screen-chat'),
   roomChat:     $('screen-room-chat'),
+  roomWait:     $('screen-room-wait'),
 };
 
 const onlineCountEls = {
@@ -117,7 +105,6 @@ const lobbyMemberCount   = $('lobby-member-count');
 const lobbyMaxCount      = $('lobby-max-count');
 const lobbyStatusText    = $('lobby-status-text');
 const lobbyAutostartFill = $('lobby-autostart-fill');
-const lobbyAutostartHint = $('lobby-autostart-hint');
 const roomVideoPanel     = $('room-video-panel');
 const roomMsgContainer   = $('room-messages-container');
 const roomChatInput      = $('room-chat-input');
@@ -128,20 +115,17 @@ const btnRoomMute        = $('btn-room-mute');
 const btnRoomCam         = $('btn-room-cam');
 const btnRoomLeave       = $('btn-room-leave');
 
-let selectedMaxMembers = 2;
-
 // ─── Screen ──────────────────────────────────────────────────────────────────
 function showScreen(name) {
   Object.values(screens).forEach(el => {
+    if (!el) return;
     el.classList.remove('active', 'fade-in');
     el.style.display = 'none';
   });
   const t = screens[name];
+  if (!t) return;
   t.style.display = 'flex';
   requestAnimationFrame(() => t.classList.add('active', 'fade-in'));
-  // FIX: pause heavy particle canvas when off landing (huge CPU win in calls)
-  const cv = document.getElementById('particleCanvas');
-  if (cv) cv.style.display = (name === 'landing') ? '' : 'none';
 }
 
 // ─── Toast ───────────────────────────────────────────────────────────────────
@@ -153,15 +137,13 @@ function showToast(msg, ms = 2800) {
   toastTmr = setTimeout(() => toastEl.classList.remove('show'), ms);
 }
 
-// ─── Particles (PERF: fewer particles, skip on mobile) ────────────────────────
+// ─── Particles ───────────────────────────────────────────────────────────────
 (function () {
   const cv = $('particleCanvas'); if (!cv) return;
-  // PERF: Skip heavy particle animation on low-end/mobile devices
   const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   if (isMobile) { cv.style.display = 'none'; return; }
-
   const cx = cv.getContext('2d');
-  const N = 25; // PERF: reduced from 40
+  const N = 25;
   const D = 70;
   const CLR = ['#00ffff','#ff00aa','#00ff88','#fff'];
   let W, H, pts = [], run = true, raf = null;
@@ -201,19 +183,14 @@ function showToast(msg, ms = 2800) {
 })();
 
 // ─── Media ───────────────────────────────────────────────────────────────────
-// FIX: peerCount >= 2 means mesh (room) mode — use small resolution by default
-// so joiners don't blast 720p to every other peer (saturates upload, kills 3+
-// connections, melts CPU). Pass 0 only for 1-to-1 stranger chat.
-async function getLocalMedia(peerCount = 0) {
+async function getLocalMedia() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-  const isRoom  = peerCount >= 2;
-  const isHeavy = peerCount >= 3;
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width:     { ideal: isHeavy ? 320 : isRoom ? 480 : 1280 },
-        height:    { ideal: isHeavy ? 240 : isRoom ? 360 : 720  },
-        frameRate: { ideal: isHeavy ? 12  : isRoom ? 15  : 30   },
+        width:     { ideal: 1280 },
+        height:    { ideal: 720  },
+        frameRate: { ideal: 30   },
         facingMode: 'user',
       },
       audio: {
@@ -234,27 +211,6 @@ async function getLocalMedia(peerCount = 0) {
       localStream = null;
       showToast('⚠ No media — text only');
     }
-  }
-}
-
-// FIX: cap per-peer encoder bitrate so N outgoing streams don't saturate uplink
-async function capSenderBitrate(pc, peerCount) {
-  const isHeavy = peerCount >= 3;
-  const maxVideo = isHeavy ? 250_000 : 600_000;   // 250kbps / 600kbps
-  const maxAudio = 24_000;
-  for (const sender of pc.getSenders()) {
-    if (!sender.track) continue;
-    try {
-      const params = sender.getParameters();
-      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate =
-        sender.track.kind === 'video' ? maxVideo : maxAudio;
-      if (sender.track.kind === 'video') {
-        params.encodings[0].maxFramerate = isHeavy ? 12 : 15;
-        params.degradationPreference = 'maintain-framerate';
-      }
-      await sender.setParameters(params);
-    } catch (e) { /* not supported on some browsers — ignore */ }
   }
 }
 
@@ -325,11 +281,8 @@ async function flushIceQueue(peerId) {
 async function createRoomPC(peerId) {
   if (roomPeers[peerId]) {
     const old = roomPeers[peerId];
-    old.onicecandidate           = null;
-    old.ontrack                  = null;
-    old.onconnectionstatechange  = null;
-    old.oniceconnectionstatechange = null;
-    old.onnegotiationneeded      = null;
+    old.onicecandidate = old.ontrack = old.onconnectionstatechange =
+      old.oniceconnectionstatechange = old.onnegotiationneeded = null;
     try { old.close(); } catch {}
     delete roomPeers[peerId];
   }
@@ -339,28 +292,22 @@ async function createRoomPC(peerId) {
   roomPeers[peerId] = pc;
 
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-  // FIX: cap encoder bitrate so mesh of 3+ peers doesn't saturate uplink
-  capSenderBitrate(pc, currentMaxMembers || roomMembers.length || 2);
 
   pc.ontrack = e => {
     if (!e.streams?.[0]) return;
     const stream = e.streams[0];
     roomStreams[peerId] = stream;
-    attachStream(peerId, stream);
+    attachRemoteStream(peerId, stream);
   };
 
   pc.onicecandidate = e => {
-    if (e.candidate) {
-      socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
-    }
+    if (e.candidate) socket.emit('room_ice', { targetId: peerId, candidate: e.candidate });
   };
 
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
-    setIndicator(peerId, s);
-
+    updateConnIndicator(s);
     if (s === 'failed') {
-      console.warn(`[Room] ICE failed for ${peerId} — restartIce`);
       try { pc.restartIce(); } catch {}
     }
   };
@@ -368,19 +315,16 @@ async function createRoomPC(peerId) {
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
     console.log(`[Room] connectionState ${peerId}: ${s}`);
-
     if (s === 'connected') {
       offerRetries[peerId] = 0;
       delete pendingOffers[peerId];
-      if (roomStreams[peerId]) attachStream(peerId, roomStreams[peerId]);
+      if (roomStreams[peerId]) attachRemoteStream(peerId, roomStreams[peerId]);
     }
-
     if (s === 'failed') {
       const retries = (offerRetries[peerId] || 0);
       if (retries < 3) {
         offerRetries[peerId] = retries + 1;
         const delay = 1500 + retries * 1000;
-        console.warn(`[Room] Conn failed for ${peerId} — retry ${offerRetries[peerId]} in ${delay}ms`);
         setTimeout(() => {
           if (roomPeers[peerId] === pc) {
             peerState[peerId] = 'idle';
@@ -389,49 +333,221 @@ async function createRoomPC(peerId) {
           }
         }, delay);
       } else {
-        console.error(`[Room] Conn permanently failed for ${peerId}`);
         showToast('⚠ Peer connection failed — try re-joining');
       }
     }
   };
-
   return pc;
 }
 
-function attachStream(peerId, stream) {
-  const vid = $(`rv-${peerId}`);
-  if (vid) {
-    vid.srcObject = stream;
-    vid.play().catch(() => {});
+// ─── 2-Person Layout ─────────────────────────────────────────────────────────
+// Layout: big remote video + small local video (PiP)
+// Single click on remote: show audio/video controls overlay
+// Double click on remote: swap — local becomes big, remote becomes small PiP
+
+function buildLayout() {
+  roomVideoPanel.innerHTML = '';
+  roomVideoPanel.className = 'video-panel room-video-panel layout-duo';
+  isVideoSwapped = false;
+
+  const others = roomMembers.filter(m => m.socketId !== mySocketId);
+  const partner = others[0];
+
+  // Big video (remote by default)
+  const bigBox = el('div', 'video-box duo-big remote-box');
+  bigBox.id = 'duo-big-box';
+
+  const bigVid = el('video');
+  Object.assign(bigVid, { id: 'duo-big-vid', autoplay: true, playsInline: true, muted: false });
+  bigBox.appendChild(bigVid);
+
+  if (partner) {
+    const lbl = el('div', 'video-label remote-label');
+    lbl.id = 'duo-big-label';
+    lbl.textContent = partner.name.toUpperCase();
+    bigBox.appendChild(lbl);
   }
-  if (focusedPeerId === peerId) {
-    const bv = $('room-big-video');
-    if (bv) { bv.srcObject = stream; bv.muted = false; bv.play().catch(() => {}); }
+
+  const ind = el('div', 'conn-indicator'); ind.id = 'conn-indicator-main'; bigBox.appendChild(ind);
+  corners(bigBox);
+
+  // Single-click overlay controls (audio + video icons)
+  if (partner) {
+    const overlay = el('div', 'duo-overlay'); overlay.id = 'duo-overlay';
+    overlay.innerHTML = `
+      <button class="duo-ctrl-btn" id="duo-ctrl-audio" title="Mute/Unmute audio">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+        </svg>
+      </button>
+      <button class="duo-ctrl-btn" id="duo-ctrl-video" title="Show/Hide video">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="23 7 16 12 23 17 23 7"></polygon>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+      </button>
+    `;
+    bigBox.appendChild(overlay);
+
+    // Single click → show/hide controls
+    let clickTimer = null;
+    bigBox.addEventListener('click', (e) => {
+      if (e.target.closest('.duo-ctrl-btn')) return;
+      clearTimeout(clickTimer);
+      clickTimer = setTimeout(() => {
+        overlay.classList.toggle('visible');
+      }, 220);
+    });
+
+    // Double click → swap big/small
+    bigBox.addEventListener('dblclick', (e) => {
+      clearTimeout(clickTimer);
+      swapVideos();
+    });
+
+    // Ctrl buttons
+    $('duo-ctrl-audio') && $('duo-ctrl-audio').addEventListener('click', e => {
+      e.stopPropagation();
+      toggleDuoRemoteAudio();
+    });
+    $('duo-ctrl-video') && $('duo-ctrl-video').addEventListener('click', e => {
+      e.stopPropagation();
+      toggleDuoRemoteVideo();
+    });
+  }
+
+  roomVideoPanel.appendChild(bigBox);
+
+  // Small PiP (local)
+  const pipBox = el('div', 'video-box duo-pip local-box');
+  pipBox.id = 'duo-pip-box';
+  const pipVid = el('video');
+  Object.assign(pipVid, { id: 'duo-pip-vid', autoplay: true, playsInline: true, muted: true });
+  if (localStream) pipVid.srcObject = localStream;
+  pipBox.appendChild(pipVid);
+  const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
+  pipBox.appendChild(pipLbl);
+
+  // Double click on PiP also swaps
+  pipBox.addEventListener('dblclick', swapVideos);
+
+  corners(pipBox);
+  roomVideoPanel.appendChild(pipBox);
+
+  // Attach remote stream if already have it
+  if (partner && roomStreams[partner.socketId]) {
+    attachRemoteStream(partner.socketId, roomStreams[partner.socketId]);
   }
 }
 
-function setIndicator(peerId, iceState) {
-  const dot = $(`ri-${peerId}`);
+let duoRemoteAudioMuted = false;
+let duoRemoteVideoHidden = false;
+
+function toggleDuoRemoteAudio() {
+  duoRemoteAudioMuted = !duoRemoteAudioMuted;
+  const vid = $('duo-big-vid');
+  const btn = $('duo-ctrl-audio');
+  if (vid) vid.muted = duoRemoteAudioMuted;
+  if (btn) {
+    btn.classList.toggle('ctrl-active', duoRemoteAudioMuted);
+    btn.title = duoRemoteAudioMuted ? 'Unmute audio' : 'Mute audio';
+    btn.innerHTML = duoRemoteAudioMuted
+      ? `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`
+      : `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+  }
+  showToast(duoRemoteAudioMuted ? '🔇 Audio muted locally' : '🔊 Audio on');
+}
+
+function toggleDuoRemoteVideo() {
+  duoRemoteVideoHidden = !duoRemoteVideoHidden;
+  const vid = $('duo-big-vid');
+  const btn = $('duo-ctrl-video');
+  if (vid) vid.style.opacity = duoRemoteVideoHidden ? '0' : '1';
+  if (btn) {
+    btn.classList.toggle('ctrl-active', duoRemoteVideoHidden);
+    btn.title = duoRemoteVideoHidden ? 'Show video' : 'Hide video';
+  }
+  showToast(duoRemoteVideoHidden ? '📷 Video hidden locally' : '📷 Video shown');
+}
+
+function swapVideos() {
+  isVideoSwapped = !isVideoSwapped;
+  const bigBox = $('duo-big-box');
+  const pipBox = $('duo-pip-box');
+  const bigVid = $('duo-big-vid');
+  const pipVid = $('duo-pip-vid');
+  const bigLbl = $('duo-big-label');
+  const pipLbl = $('duo-pip-label');
+
+  if (!bigBox || !pipBox) return;
+
+  const others  = roomMembers.filter(m => m.socketId !== mySocketId);
+  const partner = others[0];
+
+  if (isVideoSwapped) {
+    // LOCAL is big, REMOTE is PiP
+    bigBox.classList.add('local-box'); bigBox.classList.remove('remote-box');
+    pipBox.classList.add('remote-box'); pipBox.classList.remove('local-box');
+    if (bigVid) { bigVid.srcObject = localStream; bigVid.muted = true; }
+    if (pipVid && partner && roomStreams[partner.socketId]) {
+      pipVid.srcObject = roomStreams[partner.socketId]; pipVid.muted = duoRemoteAudioMuted;
+    }
+    if (bigLbl) bigLbl.textContent = 'YOU';
+    if (pipLbl) pipLbl.textContent = partner ? partner.name.toUpperCase() : 'PARTNER';
+    showToast('📺 Your video is now full-screen — double-click to switch back');
+  } else {
+    // REMOTE is big, LOCAL is PiP (default)
+    bigBox.classList.add('remote-box'); bigBox.classList.remove('local-box');
+    pipBox.classList.add('local-box'); pipBox.classList.remove('remote-box');
+    if (bigVid && partner && roomStreams[partner.socketId]) {
+      bigVid.srcObject = roomStreams[partner.socketId]; bigVid.muted = duoRemoteAudioMuted;
+    }
+    if (pipVid) { pipVid.srcObject = localStream; pipVid.muted = true; }
+    if (bigLbl) bigLbl.textContent = partner ? partner.name.toUpperCase() : 'PARTNER';
+    if (pipLbl) pipLbl.textContent = 'YOU';
+    showToast('📺 Switched back to normal view');
+  }
+}
+
+function attachRemoteStream(peerId, stream) {
+  roomStreams[peerId] = stream;
+  // In duo layout, always attach to the remote-targeted video
+  if (!isVideoSwapped) {
+    const v = $('duo-big-vid');
+    if (v) { v.srcObject = stream; v.muted = duoRemoteAudioMuted; v.play().catch(() => {}); }
+  } else {
+    const v = $('duo-pip-vid');
+    if (v) { v.srcObject = stream; v.muted = duoRemoteAudioMuted; v.play().catch(() => {}); }
+  }
+}
+
+function updateConnIndicator(iceState) {
+  const dot = $('conn-indicator-main');
   if (!dot) return;
   dot.style.background =
     (iceState === 'connected' || iceState === 'completed') ? '#00ff88' :
     iceState === 'checking'                                ? '#ffaa00' : '#ff2244';
 }
 
-// FIX: Proper guard with pendingOffers to prevent duplicate simultaneous offers
+function scheduleLayout() {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => { buildLayout(); }, 120);
+}
+
+// ─── DOM helpers ─────────────────────────────────────────────────────────────
+function el(tag, cls) { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
+function corners(box) {
+  ['tl','tr','bl','br'].forEach(c => { const d=el('div',`video-corner ${c}`); box.appendChild(d); });
+}
+
+// ─── Offer/Answer ─────────────────────────────────────────────────────────────
 async function initiateOffer(peerId) {
-  if (peerState[peerId] === 'offering' || peerState[peerId] === 'answering') {
-    console.log(`[Room] initiateOffer(${peerId}) skipped — state=${peerState[peerId]}`);
-    return;
-  }
-  if (pendingOffers[peerId]) {
-    console.log(`[Room] initiateOffer(${peerId}) skipped — already pending`);
-    return;
-  }
+  if (peerState[peerId] === 'offering' || peerState[peerId] === 'answering') return;
+  if (pendingOffers[peerId]) return;
 
   peerState[peerId] = 'offering';
   pendingOffers[peerId] = true;
-  console.log(`[Room] initiateOffer → ${peerId}`);
 
   try {
     const pc    = await createRoomPC(peerId);
@@ -447,11 +563,8 @@ async function initiateOffer(peerId) {
 
 function closeAllRoomPeers() {
   for (const [id, pc] of Object.entries(roomPeers)) {
-    pc.onicecandidate          = null;
-    pc.ontrack                 = null;
-    pc.onconnectionstatechange = null;
-    pc.oniceconnectionstatechange = null;
-    pc.onnegotiationneeded     = null;
+    pc.onicecandidate = pc.ontrack = pc.onconnectionstatechange =
+      pc.oniceconnectionstatechange = pc.onnegotiationneeded = null;
     try { pc.close(); } catch {}
   }
   for (const k of Object.keys(roomPeers))    delete roomPeers[k];
@@ -460,147 +573,6 @@ function closeAllRoomPeers() {
   for (const k of Object.keys(peerState))     delete peerState[k];
   for (const k of Object.keys(offerRetries))  delete offerRetries[k];
   for (const k of Object.keys(pendingOffers)) delete pendingOffers[k];
-}
-
-function reassignStreams() {
-  for (const [id, stream] of Object.entries(roomStreams)) attachStream(id, stream);
-}
-
-// ─── Layout ──────────────────────────────────────────────────────────────────
-function buildLayout() {
-  roomVideoPanel.innerHTML = '';
-  roomVideoPanel.className = 'video-panel room-video-panel';
-  const others = roomMembers.filter(m => m.socketId !== mySocketId);
-  const total  = roomMembers.length;
-
-  if (total <= 2) {
-    roomVideoPanel.classList.add('layout-split');
-    roomVideoPanel.appendChild(myVideoBox());
-    others.forEach(m => roomVideoPanel.appendChild(remoteVideoBox(m)));
-  } else {
-    roomVideoPanel.classList.add('layout-multi');
-    const big = el('div','room-big-wrap'); big.id = 'room-big-wrap';
-    const bv  = el('video');
-    Object.assign(bv, { id:'room-big-video', autoplay:true, playsInline:true, muted:true });
-    if (localStream) bv.srcObject = localStream;
-    big.appendChild(bv);
-    const bl = el('div','video-label local-label'); bl.id='room-big-label'; bl.textContent='YOU';
-    big.appendChild(bl);
-    corners(big); roomVideoPanel.appendChild(big);
-
-    const strip = el('div','room-strip'); strip.id='room-strip';
-    strip.appendChild(myThumb());
-    others.forEach(m => strip.appendChild(remoteThumb(m)));
-    roomVideoPanel.appendChild(strip);
-  }
-}
-
-function scheduleLayout() {
-  clearTimeout(rebuildTimer);
-  rebuildTimer = setTimeout(() => { buildLayout(); reassignStreams(); }, 100); // PERF: 100ms
-}
-
-// ─── DOM helpers ─────────────────────────────────────────────────────────────
-function el(tag, cls) { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
-function corners(box) {
-  ['tl','tr','bl','br'].forEach(c => { const d=el('div',`video-corner ${c}`); box.appendChild(d); });
-}
-
-function myVideoBox() {
-  const box = el('div','video-box local-box');
-  const vid = el('video'); Object.assign(vid, {autoplay:true, playsInline:true, muted:true});
-  if (localStream) vid.srcObject = localStream;
-  box.appendChild(vid);
-  const lbl = el('div','video-label local-label'); lbl.textContent='YOU'; box.appendChild(lbl);
-  corners(box); return box;
-}
-
-function remoteVideoBox(m) {
-  const box = el('div','video-box remote-box'); box.id=`rbox-${m.socketId}`;
-  const vid = el('video');
-  Object.assign(vid, {id:`rv-${m.socketId}`, autoplay:true, playsInline:true});
-  box.appendChild(vid);
-  const lbl = el('div','video-label remote-label'); lbl.textContent=m.name.toUpperCase(); box.appendChild(lbl);
-  const ind = el('div','conn-indicator'); ind.id=`ri-${m.socketId}`; box.appendChild(ind);
-  corners(box); return box;
-}
-
-function myThumb() {
-  const t = el('div','room-thumb-item room-thumb-me'); t.title='You';
-  const v = el('video'); Object.assign(v,{autoplay:true,playsInline:true,muted:true});
-  if (localStream) v.srcObject = localStream;
-  t.appendChild(v);
-  const s = el('span'); s.textContent='YOU'; t.appendChild(s);
-  t.addEventListener('click', focusBigMe); return t;
-}
-
-function remoteThumb(m) {
-  const t = el('div','room-thumb-item'); t.id=`rthumb-${m.socketId}`;
-  const v = el('video'); Object.assign(v,{id:`rv-${m.socketId}`,autoplay:true,playsInline:true});
-  t.appendChild(v);
-  const s = el('span'); s.textContent=m.name.slice(0,10).toUpperCase(); t.appendChild(s);
-
-  const ov = el('div','thumb-overlay');
-
-  const ba = el('button','thumb-ctrl-btn'); ba.innerHTML='🔊'; ba.title='Mute audio locally';
-  ba.onclick = e => { e.stopPropagation(); toggleRemoteAudio(m.socketId, v, ba); };
-  ov.appendChild(ba);
-
-  const bv2 = el('button','thumb-ctrl-btn'); bv2.innerHTML='📷'; bv2.title='Hide video locally';
-  bv2.onclick = e => { e.stopPropagation(); toggleRemoteVideo(m.socketId, v, bv2); };
-  ov.appendChild(bv2);
-
-  const bf = el('button','thumb-ctrl-btn thumb-ctrl-silence'); bf.innerHTML='🔕'; bf.title='Force mute for everyone';
-  bf.onclick = e => {
-    e.stopPropagation();
-    silenceState[m.socketId] = !silenceState[m.socketId];
-    const mu = silenceState[m.socketId];
-    bf.innerHTML = mu ? '🔕' : '🔔'; bf.classList.toggle('ctrl-active', mu);
-    socket.emit('room_force_mute', { roomId: currentRoomId, targetId: m.socketId, muted: mu });
-    showToast(mu ? `🔕 ${m.name} muted for all` : `🔔 ${m.name} unmuted`);
-  };
-  ov.appendChild(bf); t.appendChild(ov);
-
-  t.addEventListener('click', () => focusBigRemote(m)); return t;
-}
-
-function focusBigRemote(m) {
-  const bw = $('room-big-wrap'); if (!bw) return;
-  focusedPeerId = m.socketId;
-  const bv = $('room-big-video'), bl = $('room-big-label');
-  const v  = $(`rv-${m.socketId}`);
-  if (v?.srcObject) { bv.srcObject = v.srcObject; bv.muted = false; }
-  if (bl) bl.textContent = m.name.toUpperCase();
-  bw.classList.add('focused-remote');
-  document.querySelectorAll('.room-thumb-item').forEach(t => t.classList.remove('active-thumb'));
-  $(`rthumb-${m.socketId}`)?.classList.add('active-thumb');
-}
-
-function focusBigMe() {
-  const bw = $('room-big-wrap'); if (!bw) return;
-  focusedPeerId = null;
-  const bv = $('room-big-video'), bl = $('room-big-label');
-  if (bv && localStream) { bv.srcObject = localStream; bv.muted = true; }
-  if (bl) bl.textContent = 'YOU';
-  bw.classList.remove('focused-remote');
-  document.querySelectorAll('.room-thumb-item').forEach(t => t.classList.remove('active-thumb'));
-  document.querySelector('.room-thumb-me')?.classList.add('active-thumb');
-}
-
-function toggleRemoteAudio(id, v, btn) {
-  remoteAudioMuted[id] = !remoteAudioMuted[id];
-  v.muted = !!remoteAudioMuted[id];
-  btn.innerHTML = remoteAudioMuted[id] ? '🔇' : '🔊';
-  btn.classList.toggle('ctrl-active', !!remoteAudioMuted[id]);
-  showToast(remoteAudioMuted[id] ? '🔇 Audio muted locally' : '🔊 Audio on');
-}
-
-function toggleRemoteVideo(id, v, btn) {
-  remoteVideoOff[id] = !remoteVideoOff[id];
-  v.style.opacity = remoteVideoOff[id] ? '0' : '1';
-  btn.innerHTML = remoteVideoOff[id] ? '🚫' : '📷';
-  btn.classList.toggle('ctrl-active', !!remoteVideoOff[id]);
-  showToast(remoteVideoOff[id] ? '📷 Video hidden' : '📷 Video shown');
 }
 
 // ─── Room Chat ───────────────────────────────────────────────────────────────
@@ -629,64 +601,19 @@ function sendRoomMsg() {
 }
 
 // ─── Lobby ───────────────────────────────────────────────────────────────────
-function normalizeMaxMembers(members = roomMembers, maxMembers = currentMaxMembers) {
-  const memberCount = Array.isArray(members) ? members.length : 0;
-  const incoming = Number(maxMembers);
-  const current = Number(currentMaxMembers);
-  const selected = Number(selectedMaxMembers);
-  const candidates = [incoming, current, selected]
-    .filter(n => Number.isFinite(n) && n >= 2 && n <= 8);
-  let max = candidates.length ? Math.max(...candidates) : 2;
-
-  // If the server/client ever reports 3 members in a 2-person room, do not
-  // keep the lobby stuck at 3/2. Treat the visible members as the source of truth.
-  if (memberCount > max) max = memberCount;
-  return Math.max(2, Math.min(8, max));
-}
-
-function syncRoomState(members = roomMembers, maxMembers = currentMaxMembers) {
-  roomMembers = Array.isArray(members) ? members : [];
-  currentMaxMembers = normalizeMaxMembers(roomMembers, maxMembers);
-}
-
-function shouldAutoStartRoom() {
-  return !!currentRoomId
-    && Array.isArray(roomMembers)
-    && roomMembers.length >= normalizeMaxMembers(roomMembers, currentMaxMembers);
-}
-
-function scheduleRoomStart(isRejoin = false, delay = 500) {
-  if (!currentRoomId) return;
-  if (!isRejoin && (roomSessionStarted || roomSessionStarting)) return;
-  clearTimeout(roomStartTimer);
-  roomStartTimer = setTimeout(() => startRoomSession(isRejoin), delay);
-}
-
-async function prepareRoomMediaProfile() {
-  const peerCount = normalizeMaxMembers(roomMembers, currentMaxMembers);
-  await getLocalMedia(peerCount);
-  localStream?.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
-  localStream?.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
-}
-
-function updateLobby(members, maxMembers) {
-  syncRoomState(members, maxMembers);
-  members = roomMembers;
-  const max = currentMaxMembers || 2;
-
-  lobbyMemberCount.textContent = members.length;
-  if (lobbyMaxCount) lobbyMaxCount.textContent = max;
-
+function updateLobby(members) {
+  roomMembers = members;
+  const max = 2;
+  if (lobbyMemberCount) lobbyMemberCount.textContent = members.length;
+  if (lobbyMaxCount)    lobbyMaxCount.textContent    = max;
   const pct = Math.min(100, Math.round((members.length / max) * 100));
   if (lobbyAutostartFill) lobbyAutostartFill.style.width = pct + '%';
-
-  const remaining = Math.max(0, max - members.length);
+  const remaining = max - members.length;
   if (lobbyStatusText) {
     lobbyStatusText.textContent = remaining > 0
-      ? `WAITING FOR ${remaining} MORE MEMBER${remaining !== 1 ? 'S' : ''}`
-      : 'ALL MEMBERS PRESENT — STARTING…';
+      ? 'WAITING FOR 1 MORE PERSON'
+      : 'BOTH PRESENT — STARTING…';
   }
-
   const frag = document.createDocumentFragment();
   members.forEach(m => {
     const p = el('div','member-pill');
@@ -694,14 +621,13 @@ function updateLobby(members, maxMembers) {
     frag.appendChild(p);
   });
   lobbyMembersList.innerHTML = ''; lobbyMembersList.appendChild(frag);
-
-  if (shouldAutoStartRoom()) scheduleRoomStart(false, 650);
 }
 
-function updateMemberCount() {
-  if (roomMemberCountEl) roomMemberCountEl.textContent = roomMembers.length;
-  if (lobbyMemberCount)  lobbyMemberCount.textContent  = roomMembers.length;
-  if (lobbyMaxCount)     lobbyMaxCount.textContent     = currentMaxMembers || 2;
+// ─── Room Wait Screen (waiting for partner to rejoin) ────────────────────────
+function showRoomWaitScreen(partnerName) {
+  const msgEl = $('room-wait-msg');
+  if (msgEl) msgEl.textContent = `${partnerName} left the call. Waiting for them to rejoin…`;
+  showScreen('roomWait');
 }
 
 // ─── Socket initialisation ───────────────────────────────────────────────────
@@ -714,15 +640,14 @@ function initSocket() {
   }
 
   socket = io({
-    // PERF: websocket first for speed
     transports:             ['websocket', 'polling'],
-    upgrade:                false,   // already starting with WS, no upgrade needed
+    upgrade:                false,
     reconnection:           true,
     reconnectionAttempts:   Infinity,
-    reconnectionDelay:      800,     // FIX: faster reconnect (was 1500)
-    reconnectionDelayMax:   5000,    // FIX: shorter max (was 8000)
+    reconnectionDelay:      600,
+    reconnectionDelayMax:   4000,
     randomizationFactor:    0.3,
-    timeout:                15000,   // FIX: shorter timeout (was 20000)
+    timeout:                12000,
   });
 
   socket.on('connect', () => {
@@ -735,14 +660,12 @@ function initSocket() {
     if (reason !== 'io client disconnect') showToast('⚠ Connection lost — reconnecting…');
   });
 
-  socket.on('connect_error', err => {
-    console.warn('[SOCKET] connect_error:', err.message);
-  });
+  socket.on('connect_error', err => console.warn('[SOCKET] connect_error:', err.message));
 
   socket.io.on('reconnect', attempt => {
     mySocketId = socket.id;
     console.log('[SOCKET] reconnected attempt=', attempt);
-    if (currentRoomId && (screens.roomChat.classList.contains('active') || screens.roomLobby.classList.contains('active'))) {
+    if (currentRoomId) {
       showToast('🔄 Reconnected — rejoining room…');
       socket.emit('join_room', { roomId: currentRoomId, password: lastRoomPassword, name: myName });
     }
@@ -789,22 +712,22 @@ function initSocket() {
   socket.on('partner_left', () => { closePeerConnection(); addSys('Stranger disconnected.'); showModal(); });
 
   // ══ Room events ════════════════════════════════════════════════════════════
-  socket.on('room_created', ({ roomId, name, members, maxMembers }) => {
-    currentRoomId = roomId; myName = name; syncRoomState(members, maxMembers);
-    roomSessionStarted = false; roomSessionStarting = false;
-    lobbyRoomId.textContent = roomId; updateLobby(roomMembers, currentMaxMembers);
+  socket.on('room_created', ({ roomId, name, members }) => {
+    currentRoomId = roomId; myName = name; roomMembers = members;
+    if (lobbyRoomId) lobbyRoomId.textContent = roomId;
+    updateLobby(members);
     showScreen('roomLobby'); showToast(`✓ Room ${roomId} created!`);
   });
 
-  socket.on('room_joined', ({ roomId, name, members, maxMembers, started }) => {
-    currentRoomId = roomId; myName = name; syncRoomState(members, maxMembers);
+  socket.on('room_joined', ({ roomId, name, members, started }) => {
+    currentRoomId = roomId; myName = name; roomMembers = members;
     mySocketId = socket.id;
-    lobbyRoomId.textContent = roomId;
+    if (lobbyRoomId) lobbyRoomId.textContent = roomId;
     if (started) {
       showToast('✓ Rejoined — reconnecting video…');
-      scheduleRoomStart(true, 100);
+      startRoomSession(true);
     } else {
-      updateLobby(roomMembers, currentMaxMembers); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
+      updateLobby(members); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
     }
   });
 
@@ -816,81 +739,72 @@ function initSocket() {
     }
   });
 
-  socket.on('room_auto_start', ({ members, maxMembers }) => {
-    syncRoomState(members, maxMembers);
-    updateLobby(roomMembers, currentMaxMembers);
-    scheduleRoomStart(false, 250);
+  socket.on('room_auto_start', ({ members }) => {
+    roomMembers = members;
+    updateLobby(members);
+    setTimeout(() => startRoomSession(false), 500);
   });
 
-  socket.on('room_member_joined', ({ socketId, name, members, maxMembers, sessionActive }) => {
-    syncRoomState(members, maxMembers); updateLobby(roomMembers, currentMaxMembers); updateMemberCount();
+  socket.on('room_member_joined', ({ socketId, name, members, sessionActive }) => {
+    roomMembers = members;
+    updateLobby(members);
+    if (roomMemberCountEl) roomMemberCountEl.textContent = members.length;
     roomSys(`${name} joined`); showToast(`🟢 ${name} joined`);
 
-    if (sessionActive) {
-      if (!screens.roomChat.classList.contains('active')) {
-        scheduleRoomStart(true, 250);
-        return;
-      }
+    if (sessionActive && screens.roomChat.classList.contains('active')) {
       scheduleLayout();
-      // New member sends offers to us, we wait — glare prevention
-      console.log(`[Room] member_joined(${socketId}) sessionActive — waiting for their offers`);
+    }
+    // If we were on wait screen and partner rejoined, start session
+    if (screens.roomWait && screens.roomWait.classList.contains('active') && sessionActive) {
+      showToast(`🟢 ${name} rejoined!`);
+      startRoomSession(true);
     }
   });
 
-  socket.on('room_member_left', ({ socketId, name, members }) => {
-    syncRoomState(members, currentMaxMembers); updateMemberCount();
+  socket.on('room_member_left', ({ socketId, name, members, newHost }) => {
+    roomMembers = members;
+    if (roomMemberCountEl) roomMemberCountEl.textContent = members.length;
     roomSys(`${name} left`); showToast(`🔴 ${name} left`);
+
+    // Clean up their peer connection
     if (roomPeers[socketId]) {
       const old = roomPeers[socketId];
-      old.onicecandidate = old.ontrack = old.onconnectionstatechange = old.oniceconnectionstatechange = null;
+      old.onicecandidate = old.ontrack = old.onconnectionstatechange =
+        old.oniceconnectionstatechange = null;
       old.close();
       delete roomPeers[socketId];
     }
     delete roomStreams[socketId];
-    delete silenceState[socketId];
-    delete iceQueue[socketId];
-    delete peerState[socketId];
-    delete offerRetries[socketId];
-    delete pendingOffers[socketId];
-    ($(`rbox-${socketId}`) || $(`rthumb-${socketId}`))?.remove();
-    scheduleLayout();
+    delete iceQueue[socketId]; delete peerState[socketId];
+    delete offerRetries[socketId]; delete pendingOffers[socketId];
+  });
+
+  // FEATURE: Partner left, go to wait screen for rejoin
+  socket.on('partner_left_rejoin', ({ leftName, roomId, msg }) => {
+    showToast(`🔴 ${leftName} left`, 3000);
+    // Close existing peer connections but keep room alive
+    closeAllRoomPeers();
+    duoRemoteAudioMuted = false;
+    duoRemoteVideoHidden = false;
+    isVideoSwapped = false;
+    // Show wait screen
+    showRoomWaitScreen(leftName);
   });
 
   // ── room_offer ──────────────────────────────────────────────────────────────
   socket.on('room_offer', async ({ fromId, offer }) => {
-    console.log(`[Room] room_offer from ${fromId} | our peerState=${peerState[fromId]}`);
-
-    // Glare resolution
     if (peerState[fromId] === 'offering') {
-      if (mySocketId > fromId) {
-        console.log(`[Room] Glare: we win vs ${fromId} — ignoring their offer`);
-        return;
-      } else {
-        console.log(`[Room] Glare: they win vs ${fromId} — rolling back`);
-        peerState[fromId] = 'idle';
-        delete pendingOffers[fromId];
-      }
+      if (mySocketId > fromId) return;
+      else { peerState[fromId] = 'idle'; delete pendingOffers[fromId]; }
     }
-
-    if (peerState[fromId] === 'answering') {
-      console.warn(`[Room] Duplicate offer from ${fromId} while answering — dropping`);
-      return;
-    }
-
+    if (peerState[fromId] === 'answering') return;
     peerState[fromId] = 'answering';
 
     try {
       const pc = await createRoomPC(fromId);
-
-      if (pc.signalingState !== 'stable') {
-        console.warn(`[Room] offer from ${fromId}: bad state ${pc.signalingState}`);
-        peerState[fromId] = 'idle';
-        return;
-      }
-
+      if (pc.signalingState !== 'stable') { peerState[fromId] = 'idle'; return; }
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await flushIceQueue(fromId);
-
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('room_answer', { targetId: fromId, answer });
@@ -901,60 +815,41 @@ function initSocket() {
     }
   });
 
-  // ── room_answer ─────────────────────────────────────────────────────────────
   socket.on('room_answer', async ({ fromId, answer }) => {
     const pc = roomPeers[fromId];
-    if (!pc) { console.warn(`[Room] room_answer from ${fromId}: no PC`); return; }
-
-    const ss = pc.signalingState;
-    if (ss !== 'have-local-offer') {
-      console.warn(`[Room] room_answer from ${fromId} discarded — state: ${ss}`);
-      peerState[fromId] = 'idle';
-      delete pendingOffers[fromId];
-      return;
+    if (!pc) return;
+    if (pc.signalingState !== 'have-local-offer') {
+      peerState[fromId] = 'idle'; delete pendingOffers[fromId]; return;
     }
-
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
       await flushIceQueue(fromId);
     } catch (e) {
       console.error('[Room] room_answer handler error:', e);
     } finally {
-      peerState[fromId] = 'idle';
-      delete pendingOffers[fromId];
+      peerState[fromId] = 'idle'; delete pendingOffers[fromId];
     }
   });
 
-  // ── room_ice ─────────────────────────────────────────────────────────────────
   socket.on('room_ice', async ({ fromId, candidate }) => {
     const pc = roomPeers[fromId];
-    if (!pc || !pc.remoteDescription?.type) {
-      enqueueIce(fromId, candidate);
-      return;
-    }
-
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (e) {
-      if (candidate && candidate.candidate !== '') {
-        console.warn('[Room] ICE addCandidate error:', e.message);
-      }
-    }
+    if (!pc || !pc.remoteDescription?.type) { enqueueIce(fromId, candidate); return; }
+    try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
+    catch (e) { if (candidate?.candidate !== '') console.warn('[Room] ICE addCandidate error:', e.message); }
   });
 
   socket.on('room_request_offer', ({ fromId }) => {
-    peerState[fromId] = 'idle';
-    delete pendingOffers[fromId];
-    initiateOffer(fromId);
+    peerState[fromId] = 'idle'; delete pendingOffers[fromId]; initiateOffer(fromId);
   });
 
   socket.on('room_message', ({ from, text }) => roomMsg(text, 'received', from));
 
   socket.on('room_member_media', ({ socketId, audioMuted, videoOff }) => {
-    const b = $(`rbox-${socketId}`) || $(`rthumb-${socketId}`);
-    if (b) {
-      b.classList.toggle('remote-audio-muted', !!audioMuted);
-      b.classList.toggle('remote-video-off',   !!videoOff);
+    // In duo layout there's only one remote stream
+    const v = isVideoSwapped ? $('duo-pip-vid') : $('duo-big-vid');
+    if (v) {
+      // Only update if this is actually the remote person
+      if (audioMuted !== undefined) v.muted = audioMuted;
     }
   });
 
@@ -971,61 +866,36 @@ function initSocket() {
 
 // ─── Start / rejoin room session ─────────────────────────────────────────────
 async function startRoomSession(isRejoin = false) {
-  if (!currentRoomId) return;
-  if (!isRejoin && (roomSessionStarted || roomSessionStarting)) return;
-  if (isRejoin && roomSessionStarting) return;
+  if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
+  if (roomMemberCountEl) roomMemberCountEl.textContent = roomMembers.length;
+  duoRemoteAudioMuted = false;
+  duoRemoteVideoHidden = false;
+  isVideoSwapped = false;
 
-  clearTimeout(roomStartTimer);
-  roomStartTimer = null;
-  roomSessionStarting = true;
+  if (isRejoin) closeAllRoomPeers();
 
-  try {
-    if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
+  showScreen('roomChat');
+  buildLayout();
 
-    if (isRejoin) {
-      closeAllRoomPeers();
-    }
-
-    await prepareRoomMediaProfile();
-    roomSessionStarted = true;
-
-    showScreen('roomChat');
-    buildLayout();
-  reassignStreams();
   roomSys(isRejoin ? 'Reconnecting video…' : 'Session started! Video connecting…');
-
-  if (!isRejoin) {
-    socket.emit('room_start', { roomId: currentRoomId });
-  }
+  if (!isRejoin) socket.emit('room_start', { roomId: currentRoomId });
 
   const others = roomMembers.filter(m => m.socketId !== mySocketId);
-
   let targets;
   if (isRejoin) {
     targets = others;
   } else {
-    // FIX: Index-based ordering — lower index offers to higher, prevents glare
     const myIdx = roomMembers.findIndex(m => m.socketId === mySocketId);
     targets = roomMembers.slice(0, myIdx);
   }
 
-  console.log(`[Room] startRoomSession isRejoin=${isRejoin} | offering to ${targets.length} peers`);
-
-  // FIX: Stagger offers slightly to prevent simultaneous negotiation overload
-  // especially important for 3+ members
-  if (targets.length > 0) {
-    for (let i = 0; i < targets.length; i++) {
-      const p = targets[i];
-      // Small stagger: 0ms, 100ms, 200ms, etc.
-      setTimeout(() => {
-        if (peerState[p.socketId] === 'idle' || !peerState[p.socketId]) {
-          initiateOffer(p.socketId);
-        }
-      }, i * 100);
-    }
-  }
-  } finally {
-    roomSessionStarting = false;
+  for (let i = 0; i < targets.length; i++) {
+    const p = targets[i];
+    setTimeout(() => {
+      if (!peerState[p.socketId] || peerState[p.socketId] === 'idle') {
+        initiateOffer(p.socketId);
+      }
+    }, i * 80);
   }
 }
 
@@ -1036,17 +906,11 @@ function cleanupRoom() {
   currentRoomId    = null;
   lastRoomPassword = '';
   roomMembers      = [];
-  currentMaxMembers = 2;
-  clearTimeout(roomStartTimer);
-  roomStartTimer = null;
-  roomSessionStarted = false;
-  roomSessionStarting = false;
-  focusedPeerId    = null;
   roomMuted        = false;
   roomCamOff       = false;
-  for (const k of Object.keys(silenceState))     delete silenceState[k];
-  for (const k of Object.keys(remoteAudioMuted)) delete remoteAudioMuted[k];
-  for (const k of Object.keys(remoteVideoOff))   delete remoteVideoOff[k];
+  isVideoSwapped   = false;
+  duoRemoteAudioMuted  = false;
+  duoRemoteVideoHidden = false;
 }
 
 // ─── Stranger chat ────────────────────────────────────────────────────────────
@@ -1069,8 +933,8 @@ function sendMsg() {
 }
 
 // ─── Modal ───────────────────────────────────────────────────────────────────
-function showModal() { modalLeft.style.display = 'flex'; }
-function hideModal() { modalLeft.style.display = 'none'; }
+function showModal() { if (modalLeft) modalLeft.style.display = 'flex'; }
+function hideModal() { if (modalLeft) modalLeft.style.display = 'none'; }
 
 // ─── Stranger controls ───────────────────────────────────────────────────────
 function toggleMute() {
@@ -1145,11 +1009,11 @@ async function startCreateRoomFlow() {
   const name = createNameInput.value.trim() || 'Host';
   const pass = createPassInput.value.trim();
   if (!pass) { showToast('⚠ Set a room password'); return; }
+  myName = name;
   lastRoomPassword = pass;
-  currentMaxMembers = selectedMaxMembers;
-  await getLocalMedia(selectedMaxMembers);
+  await getLocalMedia();
   initSocket();
-  const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass, maxMembers: selectedMaxMembers }); };
+  const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass }); };
   socket.on('connect', go);
   if (socket.connected) go();
 }
@@ -1160,12 +1024,9 @@ async function startJoinRoomFlow() {
   const pass   = joinPassInput.value.trim();
   if (roomId.length !== 6) { showToast('⚠ Enter a valid 6-digit room ID'); return; }
   if (!pass)               { showToast('⚠ Enter the room password'); return; }
-  lastRoomPassword = pass;
   myName = name;
-  // FIX: joiner doesn't know maxMembers yet — assume room mode (>=2) so we
-  // start with low-res capture. If room turns out to be 3+, we'll re-grab
-  // even smaller resolution inside room_joined/room_auto_start.
-  await getLocalMedia(2);
+  lastRoomPassword = pass;
+  await getLocalMedia();
   initSocket();
   const go = () => { mySocketId = socket.id; socket.emit('join_room', { roomId, password: pass, name }); };
   socket.on('connect', go);
@@ -1189,52 +1050,14 @@ joinRoomIdInput.addEventListener('input', e => {
   e.target.value = e.target.value.replace(/\D/g,'').slice(0,6);
 });
 
-// FIX: Member count +/- selector — robust cross-browser implementation
-(function() {
-  const MIN = 2, MAX = 8;  // FIX: max raised to 8
-  const valueEl  = $('member-count-value');
-  const minusBtn = $('member-count-minus');
-  const plusBtn  = $('member-count-plus');
-
-  function render() {
-    if (valueEl) {
-      valueEl.textContent = selectedMaxMembers;
-      valueEl.setAttribute('data-value', selectedMaxMembers);
-    }
-    if (minusBtn) {
-      minusBtn.disabled = selectedMaxMembers <= MIN;
-      minusBtn.setAttribute('aria-disabled', selectedMaxMembers <= MIN);
-    }
-    if (plusBtn) {
-      plusBtn.disabled  = selectedMaxMembers >= MAX;
-      plusBtn.setAttribute('aria-disabled', selectedMaxMembers >= MAX);
-    }
-  }
-
-  if (minusBtn) {
-    minusBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (selectedMaxMembers > MIN) { selectedMaxMembers--; render(); }
-    });
-  }
-  if (plusBtn) {
-    plusBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (selectedMaxMembers < MAX) { selectedMaxMembers++; render(); }
-    });
-  }
-  render();
-})();
-
 $('btn-cancel-room').addEventListener('click', leaveRoom);
 $('btn-copy-room-id').addEventListener('click', () => {
   const roomIdText = lobbyRoomId.textContent;
-  if (navigator.clipboard && navigator.clipboard.writeText) {
+  if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(roomIdText)
       .then(() => showToast('✓ Room ID copied!'))
       .catch(() => showToast('Room ID: ' + roomIdText));
   } else {
-    // Fallback for older browsers
     const ta = document.createElement('textarea');
     ta.value = roomIdText;
     ta.style.cssText = 'position:fixed;opacity:0';
@@ -1245,6 +1068,10 @@ $('btn-copy-room-id').addEventListener('click', () => {
     document.body.removeChild(ta);
   }
 });
+
+// Room wait screen leave button
+const btnRoomWaitLeave = $('btn-room-wait-leave');
+if (btnRoomWaitLeave) btnRoomWaitLeave.addEventListener('click', leaveRoom);
 
 btnCancelWait.addEventListener('click', () => { endSession(); showScreen('landing'); });
 btnMute.addEventListener('click',        toggleMute);
