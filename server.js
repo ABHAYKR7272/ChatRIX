@@ -115,23 +115,28 @@ io.on('connection', (socket) => {
   });
 
   // ── Room: Create ────────────────────────────────────────────────────────────
-  socket.on('create_room', ({ name, password }) => {
-    const safeName = String(name || '').trim().slice(0, 24) || 'Host';
-    const safePass = String(password || '').trim().slice(0, 32);
-    const roomId   = generateRoomId();
+  socket.on('create_room', ({ name, password, maxMembers }) => {
+    const safeName   = String(name || '').trim().slice(0, 24) || 'Host';
+    const safePass   = String(password || '').trim().slice(0, 32);
+    const safeMax    = Math.min(6, Math.max(2, parseInt(maxMembers, 10) || 2));
+    const roomId     = generateRoomId();
     userNames.set(socket.id, safeName);
     rooms.set(roomId, {
-      password: safePass,
-      host:     socket.id,
-      members:  [{ socketId: socket.id, name: safeName }],
-      started:  false,
+      password:   safePass,
+      host:       socket.id,
+      maxMembers: safeMax,
+      members:    [{ socketId: socket.id, name: safeName }],
+      started:    false,
+      // Track all socket IDs that ever joined — for rejoin blocking
+      joinedIds:  new Set([socket.id]),
     });
     socket.join(roomId);
     socket.emit('room_created', {
       roomId, name: safeName,
-      members: [{ socketId: socket.id, name: safeName }],
+      members:    [{ socketId: socket.id, name: safeName }],
+      maxMembers: safeMax,
     });
-    console.log(`[ROOM] Created ${roomId} by ${safeName}`);
+    console.log(`[ROOM] Created ${roomId} by ${safeName} | max=${safeMax}`);
   });
 
   // ── Room: Join ──────────────────────────────────────────────────────────────
@@ -142,8 +147,24 @@ io.on('connection', (socket) => {
     if (!room)  { socket.emit('room_error', { msg: 'Room not found or expired' }); return; }
     if (room.password !== String(password || '').trim())
                 { socket.emit('room_error', { msg: 'Wrong password' }); return; }
-    if (room.members.length >= 6)
-                { socket.emit('room_error', { msg: 'Room is full (max 6)' }); return; }
+
+    // Block rejoin: if session is already started and this socket ID isn't
+    // a reconnection of an existing member, deny entry.
+    const isExistingMember = room.members.some(m => m.socketId === socket.id);
+    const wasEverMember    = room.joinedIds && room.joinedIds.has(socket.id);
+
+    if (room.started && !isExistingMember && !wasEverMember) {
+      socket.emit('room_error', {
+        msg: 'Session already started — this room is closed to new members.',
+        code: 'SESSION_STARTED',
+      });
+      return;
+    }
+
+    if (!room.started && room.members.length >= room.maxMembers && !isExistingMember) {
+      socket.emit('room_error', { msg: `Room is full (max ${room.maxMembers})` });
+      return;
+    }
 
     // Clear any pending close timer (rejoin within 30 s)
     if (roomTimers.has(roomId)) {
@@ -158,24 +179,36 @@ io.on('connection', (socket) => {
 
     userNames.set(socket.id, safeName);
     room.members.push({ socketId: socket.id, name: safeName });
+    if (room.joinedIds) room.joinedIds.add(socket.id);
     socket.join(roomId);
 
     socket.emit('room_joined', {
       roomId, name: safeName,
-      members: room.members,
-      started: room.started,
+      members:    room.members,
+      maxMembers: room.maxMembers,
+      started:    room.started,
     });
 
-    // Tell others: new member arrived; pass sessionActive so they know whether
-    // the call is already live (and they need to wait for offers from the newcomer)
+    // Tell others: new member arrived
     socket.to(roomId).emit('room_member_joined', {
       socketId:      socket.id,
       name:          safeName,
       members:       room.members,
+      maxMembers:    room.maxMembers,
       sessionActive: room.started,
     });
 
-    console.log(`[ROOM] ${safeName}(${socket.id}) joined ${roomId} | members=${room.members.length} started=${room.started}`);
+    console.log(`[ROOM] ${safeName}(${socket.id}) joined ${roomId} | members=${room.members.length}/${room.maxMembers} started=${room.started}`);
+
+    // ── Auto-start when all expected members are present ─────────────────────
+    if (!room.started && room.members.length === room.maxMembers) {
+      room.started = true;
+      console.log(`[ROOM] ${roomId} auto-starting — all ${room.maxMembers} members present`);
+      io.to(roomId).emit('room_auto_start', {
+        members:    room.members,
+        maxMembers: room.maxMembers,
+      });
+    }
   });
 
   // ── Room: Mark session started ─────────────────────────────────────────────
