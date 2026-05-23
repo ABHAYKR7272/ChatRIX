@@ -52,7 +52,7 @@
           </svg>
         </div>
         <div class="mode-title">CREATE ROOM</div>
-        <div class="mode-desc">Create a private room, share ID with friends (max 6)</div>
+        <div class="mode-desc">Create a private 1-on-1 room, share ID + password</div>
         <div class="mode-arrow">→</div>
       </button>
 
@@ -65,7 +65,7 @@
           </svg>
         </div>
         <div class="mode-title">JOIN ROOM</div>
-        <div class="mode-desc">Enter a room ID and password to join your crew</div>
+        <div class="mode-desc">Enter a room ID and password to connect</div>
         <div class="mode-arrow">→</div>
       </button>
     </div>
@@ -129,19 +129,12 @@
         <input type="text" id="create-pass-input" class="cyber-input" placeholder="Set a password..." maxlength="32" autocomplete="off"/>
         <div class="input-border-anim"></div>
       </div>
-      <div class="input-hint">Share this with people you want to invite</div>
+      <div class="input-hint">Share ID + password with the person you want to connect with</div>
     </div>
-    <div class="input-group" style="margin-top:16px">
-      <label class="input-label">MAX MEMBERS</label>
-      <div class="member-count-selector">
-        <button class="member-count-btn" id="member-count-minus" aria-label="Decrease">−</button>
-        <div class="member-count-display">
-          <span class="member-count-value" id="member-count-value">2</span>
-          <span class="member-count-label">MEMBERS</span>
-        </div>
-        <button class="member-count-btn" id="member-count-plus" aria-label="Increase">+</button>
-      </div>
-      <div class="input-hint">Session auto-starts when all members join</div>
+    <!-- NO max members selector — always 2 people only -->
+    <div class="room-info-badge">
+      <span class="room-info-icon">👥</span>
+      <span>Private 1-on-1 room — only 2 people</span>
     </div>
     <button class="btn-launch btn-create-room" id="btn-do-create-room">
       <span class="btn-text">⬡ CREATE ROOM</span>
@@ -209,7 +202,7 @@
   </div>
 </div>
 
-<!-- ═══ SCREEN: ROOM LOBBY (waiting for members) ═════ -->
+<!-- ═══ SCREEN: ROOM LOBBY (waiting for partner) ═════ -->
 <div id="screen-room-lobby" class="screen">
   <div class="waiting-container">
     <div class="wait-logo">CHAT-RIX</div>
@@ -218,19 +211,37 @@
       <div class="rid-value" id="lobby-room-id">------</div>
       <button class="btn-copy-id" id="btn-copy-room-id" title="Copy room ID">⎘ COPY</button>
     </div>
-    <div class="lobby-members" id="lobby-members-list">
-      <!-- member pills added dynamically -->
-    </div>
+    <div class="lobby-members" id="lobby-members-list"></div>
     <div class="lobby-status-line">
       <span class="wait-count"><span id="lobby-member-count">1</span> / <span id="lobby-max-count">2</span></span>
-      <span class="lobby-status-text" id="lobby-status-text">WAITING FOR MEMBERS</span>
+      <span class="lobby-status-text" id="lobby-status-text">WAITING FOR PARTNER</span>
     </div>
     <div class="lobby-autostart-bar">
       <div class="lobby-autostart-fill" id="lobby-autostart-fill"></div>
     </div>
-    <div class="lobby-autostart-hint" id="lobby-autostart-hint">Session auto-starts when all members join</div>
+    <div class="lobby-autostart-hint" id="lobby-autostart-hint">Session auto-starts when partner joins</div>
     <div class="wait-dots"><span></span><span></span><span></span><span></span><span></span></div>
     <button class="btn-cancel" id="btn-cancel-room" style="margin-top:18px">LEAVE ROOM</button>
+  </div>
+</div>
+
+<!-- ═══ SCREEN: ROOM WAIT (partner left, waiting for rejoin) ═════ -->
+<div id="screen-room-wait" class="screen">
+  <div class="waiting-container">
+    <div class="wait-logo">CHAT-RIX</div>
+    <div class="radar-wrap">
+      <div class="radar">
+        <div class="radar-sweep"></div>
+        <div class="radar-ring r1"></div>
+        <div class="radar-ring r2"></div>
+        <div class="radar-ring r3"></div>
+        <div class="radar-dot"></div>
+      </div>
+    </div>
+    <div class="wait-text" id="room-wait-msg">Partner left. Waiting for them to rejoin…</div>
+    <div class="wait-dots"><span></span><span></span><span></span><span></span><span></span></div>
+    <div class="wait-hint">They can rejoin using the same Room ID and password</div>
+    <button class="btn-cancel" id="btn-room-wait-leave" style="margin-top:24px">LEAVE ROOM</button>
   </div>
 </div>
 
@@ -326,7 +337,7 @@
   </div>
 </div>
 
-<!-- ═══ SCREEN: ROOM CHAT (multi-user) ══════════════ -->
+<!-- ═══ SCREEN: ROOM CHAT (2-person) ══════════════════ -->
 <div id="screen-room-chat" class="screen">
   <div class="chat-layout">
     <header class="chat-header">
@@ -336,14 +347,13 @@
           <span class="live-dot"></span>
           ROOM: <span id="room-id-display">------</span>
         </div>
-        <div class="online-tag"><span id="room-member-count-display">1</span>/6 MEMBERS</div>
+        <div class="online-tag"><span id="room-member-count-display">1</span>/2 MEMBERS</div>
       </div>
     </header>
 
     <div class="chat-main">
-      <!-- Room video grid -->
       <div class="video-panel room-video-panel" id="room-video-panel">
-        <!-- Videos populated dynamically -->
+        <!-- Duo layout populated dynamically -->
       </div>
 
       <div class="msg-panel">
