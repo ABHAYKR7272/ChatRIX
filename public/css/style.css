@@ -1833,6 +1833,8 @@ video {
     overflow: hidden;
     position: fixed;
     width: 100%;
+    /* Safe area (notch/camera) preserve karo position:fixed ke saath bhi */
+    padding-top: env(safe-area-inset-top, 0px);
   }
   .screen {
     height: 100%;
@@ -1849,6 +1851,23 @@ video {
 @supports (padding-top: env(safe-area-inset-top)) {
   body {
     padding-top: env(safe-area-inset-top);
+  }
+
+  /* Chat header: safe-area padding top add karo taaki notch ke neeche rahe */
+  .chat-header {
+    padding-top: max(10px, calc(env(safe-area-inset-top) + 6px));
+  }
+
+  /* Landing screen container bhi camera ke neeche se start ho */
+  #screen-landing .landing-container,
+  #screen-join-room .landing-container,
+  #screen-create-room .landing-container {
+    padding-top: max(40px, calc(env(safe-area-inset-top) + 20px));
+  }
+
+  /* Waiting screens bhi */
+  .waiting-container {
+    padding-top: max(20px, calc(env(safe-area-inset-top) + 12px));
   }
 }
 
