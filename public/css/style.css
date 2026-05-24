@@ -1842,3 +1842,12 @@ video {
     height: 100%;
   }
 }
+
+/* ── FIX: Punch-hole / notch camera overlap ── */
+/* Jo phones me camera screen ke andar hota hai (punch-hole/notch)
+   unpe content camera ke neeche se start ho — overlap nahi hoga */
+@supports (padding-top: env(safe-area-inset-top)) {
+  body {
+    padding-top: env(safe-area-inset-top);
+  }
+}
