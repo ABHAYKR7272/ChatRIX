@@ -1851,3 +1851,67 @@ video {
     padding-top: env(safe-area-inset-top);
   }
 }
+
+/* ── FIX: Android WebView video play button overlay remove ── */
+video::-webkit-media-controls {
+  display: none !important;
+}
+video::-webkit-media-controls-enclosure {
+  display: none !important;
+}
+video::-webkit-media-controls-panel {
+  display: none !important;
+}
+video::-webkit-media-controls-overlay-play-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
+video::-webkit-media-controls-start-playback-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
+/* Android specific — inline playback force */
+video {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* ── FIX: Header/elements video module ke upar overlap nahi karenge ── */
+@media (hover: none) and (pointer: coarse) {
+  /* Chat layout flex column — header pehle, phir video, phir controls */
+  #screen-chat .chat-layout,
+  #screen-room-chat .chat-layout {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Header apni jagah pe rahe — video ke upar nahi jaaye */
+  .chat-header {
+    position: relative !important;
+    z-index: 2;
+    flex-shrink: 0;
+  }
+
+  /* Video panel header ke NEECHE rahe */
+  .chat-main {
+    position: relative !important;
+    z-index: 1;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* Controls bar bilkul neeche */
+  .controls-bar {
+    position: relative !important;
+    z-index: 2;
+    flex-shrink: 0;
+  }
+}
