@@ -186,35 +186,43 @@ function showToast(msg, ms = 2800) {
 })();
 
 // ─── Media ───────────────────────────────────────────────────────────────────
+const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
 async function getLocalMedia() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+
+  // Mobile: lower res to avoid rejection on budget Android devices
+  const videoConstraints = IS_MOBILE
+    ? { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { max: 30 } }
+    : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: 'user' };
+
+  const audioConstraints = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+
+  // Try 1: Video + Audio with constraints
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width:     { ideal: 1280 },
-        height:    { ideal: 720  },
-        frameRate: { ideal: 30   },
-        facingMode: 'user',
-      },
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        sampleRate: 16000,
-        channelCount: 1,
-      },
-    });
+    localStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: audioConstraints });
     localVideo.srcObject = localStream;
-  } catch {
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localVideo.srcObject = null;
-      showToast('⚠ Camera unavailable — audio only');
-    } catch {
-      localStream = null;
-      showToast('⚠ No media — text only');
-    }
-  }
+    return;
+  } catch (e1) { console.warn('[media] v+a failed:', e1.name); }
+
+  // Try 2: Any video + audio (widest compatibility)
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localStream;
+    return;
+  } catch (e2) { console.warn('[media] video:true failed:', e2.name); }
+
+  // Try 3: Audio only
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    localVideo.srcObject = null;
+    showToast('⚠ Camera unavailable — audio only');
+    return;
+  } catch (e3) { console.warn('[media] audio-only failed:', e3.name); }
+
+  // Final: no media
+  localStream = null;
+  showToast('⚠ Camera & mic unavailable — text only');
 }
 
 function stopLocalMedia() {
