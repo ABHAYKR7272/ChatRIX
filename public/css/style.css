@@ -421,7 +421,10 @@ html, body {
    CHAT SCREEN
 ══════════════════════════════════════════════════ */
 #screen-chat {
-  background: var(--bg); align-items: stretch; justify-content: stretch;
+  background: var(--bg); align-items: stretch; justify-content: flex-start;
+}
+#screen-room-chat {
+  background: var(--bg); align-items: stretch; justify-content: flex-start;
 }
 .chat-layout {
   width: 100%; height: 100%;
@@ -466,11 +469,11 @@ html, body {
 
 /* Video Panel — PERF: contain:paint isolates repaints to this box */
 .video-panel {
-  flex: 1.8; display: flex; flex-direction: row;
+  flex: 2.4; display: flex; flex-direction: row;
   gap: 4px; padding: 8px;
   background: #010608;
   position: relative; min-width: 0;
-  contain: layout paint;
+  contain: paint;
 }
 .video-box {
   flex: 1; position: relative; overflow: hidden;
@@ -608,6 +611,8 @@ html, body {
   background: var(--panel);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+  position: relative;
+  z-index: 20;
 }
 .ctrl-btn {
   display: flex; flex-direction: column;
@@ -727,14 +732,17 @@ html, body {
 @media (max-width: 700px) {
   .chat-main { flex-direction: column; }
 
-  .video-panel {
-    flex: none;
-    height: 52vh; flex-direction: row;
+  .video-panel,
+  .room-video-panel {
+    flex: none !important;
+    height: 42vh !important;
+    flex-direction: row;
   }
 
   .msg-panel {
     flex: 1; max-width: 100%;
     border-left: none; border-top: 1px solid var(--border);
+    min-height: 0;
   }
 
   .controls-bar { gap: 5px; padding: 8px 10px; }
@@ -976,13 +984,13 @@ html, body {
 
 /* ─── Room Chat Screen ───────────────────────── */
 .room-video-panel {
-  flex: 1;
+  flex: 2.4;
   display: flex;
   position: relative;
   gap: 6px;
   min-height: 0;
   overflow: hidden;
-  contain: layout paint;  /* PERF: isolate video panel repaints */
+  contain: paint;
 }
 
 .room-video-panel.layout-split { flex-direction: row; }
@@ -1640,9 +1648,8 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 55vw !important;
-    min-height: 180px;
-    max-height: 310px;
+    height: 39vh !important;
+    min-height: 160px;
     flex-direction: row !important;
     padding: 4px;
   }
@@ -1728,8 +1735,8 @@ html, body {
   .video-panel,
   .room-video-panel {
     flex: none !important;
-    height: 50vw !important;
-    min-height: 200px;
+    height: 39vh !important;
+    min-height: 175px;
     padding: 5px;
   }
 
@@ -1776,4 +1783,154 @@ html, body {
   transition: flex 0.35s cubic-bezier(0.4,0,0.2,1),
               opacity 0.25s ease,
               min-width 0.35s cubic-bezier(0.4,0,0.2,1);
+}
+
+/* ── ANDROID WEBVIEW FIXES (safe-area only, zero UI change) ── */
+/* Scanlines/noise never block touch events */
+.scanlines, .noise-overlay { pointer-events: none !important; }
+
+/* Safe area for notch/navbar devices — controls bar ke liye */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .controls-bar {
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+}
+
+/* Android: input zoom prevent (16px minimum) */
+@media (hover: none) and (pointer: coarse) {
+  .cyber-input, .msg-input { font-size: max(16px, 1rem); }
+  /* duo-overlay always visible on touch (no hover on mobile) */
+  .duo-overlay { opacity: 1 !important; }
+  /* Bigger touch targets for overlay buttons */
+  .duo-ctrl-btn { width: 40px; height: 40px; }
+}
+
+/* ── FIX: Android camera color strip remove ── */
+/* WebView me video element ke upar jo colored bar/strip aata hai use hide karo */
+video::-webkit-media-controls,
+video::-webkit-media-controls-enclosure,
+video::-webkit-media-controls-panel,
+video::-webkit-media-controls-play-button,
+video::-webkit-media-controls-timeline,
+video::-webkit-media-controls-current-time-display,
+video::-webkit-media-controls-fullscreen-button,
+video::-webkit-media-controls-overlay-play-button {
+  display: none !important;
+  -webkit-appearance: none;
+  opacity: 0 !important;
+}
+video {
+  -webkit-appearance: none;
+}
+
+/* ── FIX: Keyboard open hone pe layout shift nahi hoga ── */
+/* dvh = dynamic viewport height — keyboard ke saath adjust hota hai */
+@media (hover: none) and (pointer: coarse) {
+  html, body {
+    height: 100%;
+    min-height: 100%;
+    /* Keyboard open hone pe body resize nahi hogi */
+    overflow: hidden;
+    position: fixed;
+    width: 100%;
+    /* Safe area (notch/camera) preserve karo position:fixed ke saath bhi */
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .screen {
+    height: 100%;
+    min-height: 100%;
+  }
+  .chat-layout {
+    height: 100%;
+  }
+}
+
+/* ── FIX: Punch-hole / notch camera overlap ── */
+/* Jo phones me camera screen ke andar hota hai (punch-hole/notch)
+   unpe content camera ke neeche se start ho — overlap nahi hoga */
+@supports (padding-top: env(safe-area-inset-top)) {
+  body {
+    padding-top: env(safe-area-inset-top);
+  }
+
+  /* Chat header: safe-area padding top add karo taaki notch ke neeche rahe */
+  .chat-header {
+    padding-top: max(10px, calc(env(safe-area-inset-top) + 6px));
+  }
+
+  /* Landing screen container bhi camera ke neeche se start ho */
+  #screen-landing .landing-container,
+  #screen-join-room .landing-container,
+  #screen-create-room .landing-container {
+    padding-top: max(40px, calc(env(safe-area-inset-top) + 20px));
+  }
+
+  /* Waiting screens bhi */
+  .waiting-container {
+    padding-top: max(20px, calc(env(safe-area-inset-top) + 12px));
+  }
+}
+
+/* ── FIX: Android WebView video play button overlay remove ── */
+video::-webkit-media-controls {
+  display: none !important;
+}
+video::-webkit-media-controls-enclosure {
+  display: none !important;
+}
+video::-webkit-media-controls-panel {
+  display: none !important;
+}
+video::-webkit-media-controls-overlay-play-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
+video::-webkit-media-controls-start-playback-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
+/* Android specific — inline playback force */
+video {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* ── FIX: Header/elements video module ke upar overlap nahi karenge ── */
+@media (hover: none) and (pointer: coarse) {
+  /* Chat layout flex column — header pehle, phir video, phir controls */
+  #screen-chat .chat-layout,
+  #screen-room-chat .chat-layout {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Header apni jagah pe rahe — video ke upar nahi jaaye */
+  .chat-header {
+    position: relative !important;
+    z-index: 2;
+    flex-shrink: 0;
+  }
+
+  /* Video panel header ke NEECHE rahe */
+  .chat-main {
+    position: relative !important;
+    z-index: 1;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* Controls bar bilkul neeche */
+  .controls-bar {
+    position: relative !important;
+    z-index: 2;
+    flex-shrink: 0;
+  }
 }
