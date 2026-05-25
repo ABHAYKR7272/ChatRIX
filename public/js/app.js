@@ -186,15 +186,16 @@ function showToast(msg, ms = 2800) {
 })();
 
 // ─── Media ───────────────────────────────────────────────────────────────────
-const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-
 async function getLocalMedia() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: IS_MOBILE
-        ? { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
-        : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: 'user' },
+      video: {
+        width:     { ideal: 1280 },
+        height:    { ideal: 720  },
+        frameRate: { ideal: 30   },
+        facingMode: 'user',
+      },
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -206,17 +207,12 @@ async function getLocalMedia() {
     localVideo.srcObject = localStream;
   } catch {
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localVideo.srcObject = localStream;
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localVideo.srcObject = null;
+      showToast('⚠ Camera unavailable — audio only');
     } catch {
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        localVideo.srcObject = null;
-        showToast('⚠ Camera unavailable — audio only');
-      } catch {
-        localStream = null;
-        showToast('⚠ No media — text only');
-      }
+      localStream = null;
+      showToast('⚠ No media — text only');
     }
   }
 }
@@ -775,21 +771,6 @@ function initSocket() {
     // Update stranger panel label
     const lbl = $('stranger-big-label');
     if (lbl) lbl.textContent = partnerName.toUpperCase();
-
-    // Re-attach local video if stream exists (important after skip)
-    if (localStream && localVideo) {
-      localVideo.srcObject = localStream;
-      localVideo.muted = true;
-    }
-
-    // Reset remote video state
-    const remVid = $('remoteVideo');
-    if (remVid) { remVid.style.opacity = '1'; remVid.srcObject = null; }
-    if (remoteStatus) {
-      remoteStatus.textContent = 'Connecting…';
-      remoteStatus.classList.remove('hidden');
-    }
-
     clearMsgs(); addSys(`Connected to ${partnerName}. Say hello!`);
     showScreen('chat');
     initStrangerPanel();
@@ -820,14 +801,7 @@ function initSocket() {
   });
 
   socket.on('chat_message', ({ from, text }) => addMsg(text, 'received', from));
-  socket.on('partner_left', () => {
-    closePeerConnection();
-    addSys('Stranger disconnected.');
-    // Reset remote video
-    const remVid = $('remoteVideo');
-    if (remVid) { remVid.style.opacity = '1'; }
-    showModal();
-  });
+  socket.on('partner_left', () => { closePeerConnection(); addSys('Stranger disconnected.'); showModal(); });
 
   // ══ Room events ════════════════════════════════════════════════════════════
   socket.on('room_created', ({ roomId, name, members }) => {
@@ -1056,72 +1030,29 @@ function hideModal() { if (modalLeft) modalLeft.style.display = 'none'; }
 
 // ─── Stranger controls ───────────────────────────────────────────────────────
 function toggleMute() {
-  if (!localStream) { showToast('⚠ No microphone available'); return; }
   isMuted = !isMuted;
-  localStream.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
+  localStream?.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
   btnMute.classList.toggle('active', isMuted);
   btnMute.querySelector('.icon-unmuted').style.display = isMuted ? 'none' : 'block';
   btnMute.querySelector('.icon-muted').style.display   = isMuted ? 'block' : 'none';
   showToast(isMuted ? '🎤 Muted' : '🎤 Mic on');
 }
 function toggleCamera() {
-  if (!localStream) { showToast('⚠ No camera available'); return; }
   isCamOff = !isCamOff;
-  localStream.getVideoTracks().forEach(t => { t.enabled = !isCamOff; });
+  localStream?.getVideoTracks().forEach(t => { t.enabled = !isCamOff; });
   btnVideoToggle.classList.toggle('active', isCamOff);
   btnVideoToggle.querySelector('.icon-cam-on').style.display  = isCamOff ? 'none' : 'block';
   btnVideoToggle.querySelector('.icon-cam-off').style.display = isCamOff ? 'block' : 'none';
   showToast(isCamOff ? '📷 Camera off' : '📷 Camera on');
 }
 function skipStranger() {
-  closePeerConnection();
-
-  // Reset all stranger-mode state
-  strangerFullscreen = null;
-  strangerRemoteAudioMuted = false;
-  strangerRemoteVideoHidden = false;
-
-  // Reset video panel classes
+  closePeerConnection(); addSys('Searching for next stranger…');
+  strangerFullscreen = null; strangerRemoteAudioMuted = false; strangerRemoteVideoHidden = false;
   const panelEl = $('video-panel-stranger');
   if (panelEl) panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
-
-  // Reset remote video opacity
   const remVid = $('remoteVideo');
-  if (remVid) { remVid.style.opacity = '1'; remVid.srcObject = null; }
-
-  // Reset mute/cam state and UI buttons
-  isMuted = false; isCamOff = false;
-  if (localStream) {
-    localStream.getAudioTracks().forEach(t => { t.enabled = true; });
-    localStream.getVideoTracks().forEach(t => { t.enabled = true; });
-  }
-  if (btnMute) {
-    btnMute.classList.remove('active');
-    const u = btnMute.querySelector('.icon-unmuted');
-    const m = btnMute.querySelector('.icon-muted');
-    if (u) u.style.display = 'block';
-    if (m) m.style.display = 'none';
-  }
-  if (btnVideoToggle) {
-    btnVideoToggle.classList.remove('active');
-    const on  = btnVideoToggle.querySelector('.icon-cam-on');
-    const off = btnVideoToggle.querySelector('.icon-cam-off');
-    if (on)  on.style.display  = 'block';
-    if (off) off.style.display = 'none';
-  }
-
-  // Ensure local video is still showing (stream may still be live)
-  if (localStream && localVideo) localVideo.srcObject = localStream;
-
-  // Reset remote status overlay
-  if (remoteStatus) {
-    remoteStatus.textContent = 'Connecting…';
-    remoteStatus.classList.remove('hidden');
-  }
-
-  addSys('Searching for next stranger…');
-  socket.emit('skip');
-  showScreen('waiting');
+  if (remVid) remVid.style.opacity = '1';
+  socket.emit('skip'); showScreen('waiting');
 }
 function endSession() {
   closePeerConnection(); stopLocalMedia();
@@ -1141,9 +1072,8 @@ function endSession() {
 
 // ─── Room controls ────────────────────────────────────────────────────────────
 function toggleRoomMute() {
-  if (!localStream) { showToast('⚠ No microphone available'); return; }
   roomMuted = !roomMuted;
-  localStream.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
+  localStream?.getAudioTracks().forEach(t => { t.enabled = !roomMuted; });
   btnRoomMute.classList.toggle('active', roomMuted);
   btnRoomMute.querySelector('.icon-unmuted').style.display = roomMuted ? 'none' : 'block';
   btnRoomMute.querySelector('.icon-muted').style.display   = roomMuted ? 'block' : 'none';
@@ -1151,9 +1081,8 @@ function toggleRoomMute() {
   showToast(roomMuted ? '🎤 Muted' : '🎤 Mic on');
 }
 function toggleRoomCam() {
-  if (!localStream) { showToast('⚠ No camera available'); return; }
   roomCamOff = !roomCamOff;
-  localStream.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
+  localStream?.getVideoTracks().forEach(t => { t.enabled = !roomCamOff; });
   btnRoomCam.classList.toggle('active', roomCamOff);
   btnRoomCam.querySelector('.icon-cam-on').style.display  = roomCamOff ? 'none' : 'block';
   btnRoomCam.querySelector('.icon-cam-off').style.display = roomCamOff ? 'block' : 'none';
@@ -1270,29 +1199,3 @@ $('modal-home').addEventListener('click', () => { hideModal(); endSession(); });
 
 window.addEventListener('popstate', e => e.preventDefault());
 showScreen('landing');
-
-// ── FIX: Android keyboard open/close pe layout shift nahi hoga ──
-(function () {
-  if (!window.visualViewport) return;
-  const IS_TOUCH = ('ontouchstart' in window);
-  if (!IS_TOUCH) return;
-
-  // Keyboard open hone par chat-layout ki height fix rakho
-  function onViewportResize() {
-    const vh = window.visualViewport.height;
-    // Sirf chat screens pe apply karo
-    const chatEl   = document.getElementById('screen-chat');
-    const roomEl   = document.getElementById('screen-room-chat');
-    const activeEl = (chatEl && chatEl.classList.contains('active')) ? chatEl
-                   : (roomEl && roomEl.classList.contains('active')) ? roomEl
-                   : null;
-    if (!activeEl) return;
-    const layout = activeEl.querySelector('.chat-layout');
-    if (!layout) return;
-    // Height set karo viewport ke hisab se — keyboard ke liye adjust hoga
-    layout.style.height = vh + 'px';
-  }
-
-  window.visualViewport.addEventListener('resize', onViewportResize);
-  window.visualViewport.addEventListener('scroll', onViewportResize);
-})();
