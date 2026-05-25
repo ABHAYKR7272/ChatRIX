@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   CHAT-RIX  —  app.js  v3.0  (Multi-Person Rooms 2-6)
+   CHAT-RIX  —  app.js  v2.0  (2-Person Rooms, Fast, Smooth)
    ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -45,26 +45,18 @@ let roomMembers      = [];
 let mySocketId       = null;
 let roomMuted        = false;
 let roomCamOff       = false;
-let isVideoSwapped   = false;
-let strangerFullscreen = null;
+let isVideoSwapped   = false;  // double-click swap state
+let strangerFullscreen = null;  // null | 'big' | 'pip'
 let strangerRemoteAudioMuted = false;
 let strangerRemoteVideoHidden = false;
 
-// Multi-person room: which box is "focused" (shown big)
-let focusedPeerId = null;    // null = auto (first remote), or socketId
-let fullscreenPeerId = null; // null or socketId for full screen
-
-// Room peer connections
+// Room peer (only 1 peer in 2-person room)
 const roomPeers    = {};
 const roomStreams   = {};
 const iceQueue     = {};
 const peerState    = {};
 const offerRetries = {};
 const pendingOffers = {};
-
-// Per-peer local mute/hide toggles (what WE see of them)
-const peerAudioMuted = {};
-const peerVideoHidden = {};
 
 let rebuildTimer = null;
 
@@ -125,9 +117,6 @@ const roomMemberCountEl  = $('room-member-count-display');
 const btnRoomMute        = $('btn-room-mute');
 const btnRoomCam         = $('btn-room-cam');
 const btnRoomLeave       = $('btn-room-leave');
-
-// Member selector state
-let selectedMaxMembers = 2;
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 function showScreen(name) {
@@ -285,12 +274,15 @@ function initStrangerPanel() {
 
   if (!bigBox || !pipBox || !panel) return;
 
+  // Double-tap/click on remote → fullscreen
   addDoubleTapListener(bigBox, (e) => {
     if (e.target && e.target.closest('.duo-ctrl-btn')) return;
     toggleStrangerFullscreen('big');
   });
+  // Double-tap/click on local → fullscreen
   addDoubleTapListener(pipBox, () => toggleStrangerFullscreen('pip'));
 
+  // Overlay stop propagation
   if (overlay) {
     overlay.addEventListener('click', e => e.stopPropagation());
     overlay.addEventListener('dblclick', e => e.stopPropagation());
@@ -406,7 +398,7 @@ async function createRoomPC(peerId) {
 
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
-    updateConnIndicator(peerId, s);
+    updateConnIndicator(s);
     if (s === 'failed') {
       try { pc.restartIce(); } catch {}
     }
@@ -440,22 +432,16 @@ async function createRoomPC(peerId) {
   return pc;
 }
 
-// ─── Multi-Person Layout ─────────────────────────────────────────────────────
-// Layout rules:
-//   1 remote  → big (like duo: 1 big + 1 small local pip)
-//   2 remotes → 1 big top + 2 small bottom row (+ local pip)
-//   3 remotes → 1 big top + 3 small bottom (+ local pip)
-//   4 remotes → 1 big top + 4 small bottom (+ local pip)
-//   5 remotes → 1 big top + 5 small bottom (+ local pip)
-//
-// "focused" peer = shown in big slot (default = first remote)
-// Single click any small box → it becomes focused (big)
-// Double click any box → full screen overlay
-// Double click fullscreen → exit
-// Clicking focused peer box → no change (already big)
+// ─── 2-Person Layout ─────────────────────────────────────────────────────────
+// Layout: big remote video + small local video (PiP)
+// Single click on remote: show audio/video controls overlay
+// Double click on remote: swap — local becomes big, remote becomes small PiP
 
+// ─── Double-tap helper (works on both desktop dblclick and mobile touch) ──────
 function addDoubleTapListener(el, cb) {
+  // Desktop
   el.addEventListener('dblclick', (e) => cb(e));
+  // Mobile touch — detect two taps within 300ms
   let lastTap = 0;
   el.addEventListener('touchend', (e) => {
     const now = Date.now();
@@ -468,315 +454,164 @@ function addDoubleTapListener(el, cb) {
   }, { passive: false });
 }
 
-function buildLayout() {
-  if (!roomVideoPanel) return;
-  roomVideoPanel.innerHTML = '';
-  roomVideoPanel.className = 'video-panel room-video-panel';
+// Track which panel is fullscreened: null | 'big' | 'pip'
+let fullscreenPanel = null;
 
-  fullscreenPeerId = null;
+function buildLayout() {
+  roomVideoPanel.innerHTML = '';
+  roomVideoPanel.className = 'video-panel room-video-panel layout-duo';
+  isVideoSwapped = false;
+  fullscreenPanel = null;
 
   const others = roomMembers.filter(m => m.socketId !== mySocketId);
+  const partner = others[0];
 
-  // Determine focused peer
-  if (!focusedPeerId || !others.find(m => m.socketId === focusedPeerId)) {
-    focusedPeerId = others.length > 0 ? others[0].socketId : null;
+  // ── REMOTE panel (left / "big" by default) ──────────────────────
+  const bigBox = el('div', 'video-box duo-big remote-box');
+  bigBox.id = 'duo-big-box';
+
+  const bigVid = el('video');
+  Object.assign(bigVid, { id: 'duo-big-vid', autoplay: true, playsInline: true, muted: false });
+  bigBox.appendChild(bigVid);
+
+  // Partner label
+  if (partner) {
+    const lbl = el('div', 'video-label remote-label');
+    lbl.id = 'duo-big-label';
+    lbl.textContent = partner.name.toUpperCase();
+    bigBox.appendChild(lbl);
   }
 
-  if (others.length === 0) {
-    // Only me in the room — show just local
-    buildSoloLayout();
-    return;
-  }
+  // Connection indicator dot
+  const ind = el('div', 'conn-indicator'); ind.id = 'conn-indicator-main'; bigBox.appendChild(ind);
+  corners(bigBox);
 
-  if (others.length === 1) {
-    buildDuoLayout(others[0]);
-  } else {
-    buildMultiLayout(others);
-  }
-}
+  // Partner controls overlay (always visible small icons, top-right)
+  if (partner) {
+    const overlay = el('div', 'duo-overlay'); overlay.id = 'duo-overlay';
+    overlay.innerHTML = `
+      <button class="duo-ctrl-btn" id="duo-ctrl-audio" title="Mute partner audio">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+        </svg>
+      </button>
+      <button class="duo-ctrl-btn" id="duo-ctrl-video" title="Hide partner video">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polygon points="23 7 16 12 23 17 23 7"></polygon>
+          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+      </button>
+    `;
+    bigBox.appendChild(overlay);
 
-function buildSoloLayout() {
-  roomVideoPanel.className += ' layout-solo';
-  const box = el('div', 'video-box solo-box local-box');
-  const vid = el('video');
-  Object.assign(vid, { autoplay: true, playsInline: true, muted: true });
-  if (localStream) vid.srcObject = localStream;
-  box.appendChild(vid);
-  const lbl = el('div', 'video-label local-label'); lbl.textContent = 'YOU';
-  box.appendChild(lbl);
-  corners(box);
-  roomVideoPanel.appendChild(box);
-}
-
-function buildDuoLayout(partner) {
-  roomVideoPanel.className += ' layout-duo';
-
-  // Big box (focused = partner)
-  const bigBox = createRemoteBox(partner, true);
-  bigBox.id = 'room-big-box';
-  roomVideoPanel.appendChild(bigBox);
-
-  // PiP (local)
-  const pipBox = createLocalPip();
-  roomVideoPanel.appendChild(pipBox);
-}
-
-function buildMultiLayout(others) {
-  roomVideoPanel.className += ' layout-multi';
-
-  // Top: big focused box
-  const focusedMember = others.find(m => m.socketId === focusedPeerId) || others[0];
-
-  const bigWrap = el('div', 'multi-top-row');
-  const bigBox = createRemoteBox(focusedMember, true);
-  bigBox.id = 'room-big-box';
-  bigWrap.appendChild(bigBox);
-  roomVideoPanel.appendChild(bigWrap);
-
-  // Bottom: all others (non-focused remotes + local)
-  const bottomRow = el('div', 'multi-bottom-row');
-  bottomRow.id = 'multi-bottom-row';
-
-  // Non-focused remotes
-  others.forEach(m => {
-    if (m.socketId === focusedMember.socketId) return;
-    const box = createRemoteBox(m, false);
-    bottomRow.appendChild(box);
-  });
-
-  // Local pip at end of bottom row
-  const localBox = createLocalPip();
-  localBox.classList.add('bottom-local');
-  bottomRow.appendChild(localBox);
-
-  roomVideoPanel.appendChild(bottomRow);
-}
-
-function createRemoteBox(member, isBig) {
-  const box = el('div', `video-box remote-box ${isBig ? 'multi-big' : 'multi-small'}`);
-  box.dataset.peerId = member.socketId;
-
-  const vid = el('video');
-  vid.id = `room-vid-${member.socketId}`;
-  Object.assign(vid, { autoplay: true, playsInline: true, muted: false });
-  box.appendChild(vid);
-
-  // Attach stream if available
-  if (roomStreams[member.socketId]) {
-    vid.srcObject = roomStreams[member.socketId];
-    vid.muted = peerAudioMuted[member.socketId] || false;
-    vid.style.opacity = peerVideoHidden[member.socketId] ? '0' : '1';
-  }
-
-  // Name label
-  const lbl = el('div', 'video-label remote-label');
-  lbl.textContent = member.name.toUpperCase();
-  box.appendChild(lbl);
-
-  // Connection indicator (only on big)
-  if (isBig) {
-    const ind = el('div', 'conn-indicator');
-    ind.id = `conn-ind-${member.socketId}`;
-    box.appendChild(ind);
-  }
-
-  // Controls overlay (audio + video mute for this peer) — show on big box
-  if (isBig) {
-    const overlay = el('div', 'duo-overlay');
-    overlay.id = `overlay-${member.socketId}`;
-    overlay.innerHTML = buildPeerControls(member.socketId);
+    // Ctrl buttons — stop all events so double-tap doesn't fire fullscreen
     overlay.addEventListener('click', e => e.stopPropagation());
     overlay.addEventListener('dblclick', e => e.stopPropagation());
     overlay.addEventListener('touchend', e => e.stopPropagation());
-    overlay.querySelector('.room-ctrl-audio').addEventListener('click', () => togglePeerAudio(member.socketId));
-    overlay.querySelector('.room-ctrl-video').addEventListener('click', () => togglePeerVideo(member.socketId));
-    box.appendChild(overlay);
+    overlay.querySelector('#duo-ctrl-audio').addEventListener('click', toggleDuoRemoteAudio);
+    overlay.querySelector('#duo-ctrl-video').addEventListener('click', toggleDuoRemoteVideo);
+    overlay.querySelector('#duo-ctrl-audio').addEventListener('touchend', (e) => { e.stopPropagation(); });
+    overlay.querySelector('#duo-ctrl-video').addEventListener('touchend', (e) => { e.stopPropagation(); });
   }
 
-  corners(box);
-
-  // Single click small box → focus it (make it big)
-  if (!isBig) {
-    box.addEventListener('click', (e) => {
-      if (e.target.closest('.duo-ctrl-btn')) return;
-      focusedPeerId = member.socketId;
-      scheduleLayout();
-    });
-    box.style.cursor = 'pointer';
-  }
-
-  // Double click big → fullscreen; double click small → also fullscreen
-  addDoubleTapListener(box, (e) => {
+  // Double-click / double-tap remote panel → fullscreen
+  addDoubleTapListener(bigBox, (e) => {
     if (e.target && e.target.closest('.duo-ctrl-btn')) return;
-    togglePeerFullscreen(member.socketId);
+    toggleFullscreen('big');
   });
 
-  return box;
-}
+  roomVideoPanel.appendChild(bigBox);
 
-function createLocalPip() {
+  // ── LOCAL panel (right / "pip" by default) ──────────────────────
   const pipBox = el('div', 'video-box duo-pip local-box');
   pipBox.id = 'duo-pip-box';
 
   const pipVid = el('video');
-  pipVid.id = 'duo-pip-vid';
-  Object.assign(pipVid, { autoplay: true, playsInline: true, muted: true });
+  Object.assign(pipVid, { id: 'duo-pip-vid', autoplay: true, playsInline: true, muted: true });
   if (localStream) pipVid.srcObject = localStream;
   pipBox.appendChild(pipVid);
 
-  const pipLbl = el('div', 'video-label local-label');
-  pipLbl.textContent = 'YOU';
+  const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
   pipBox.appendChild(pipLbl);
 
-  // Double click local pip → fullscreen
-  addDoubleTapListener(pipBox, () => toggleLocalFullscreen());
+  // Double-click / double-tap local panel → fullscreen
+  addDoubleTapListener(pipBox, () => toggleFullscreen('pip'));
 
   corners(pipBox);
-  return pipBox;
-}
+  roomVideoPanel.appendChild(pipBox);
 
-function buildPeerControls(peerId) {
-  const audioMuted = peerAudioMuted[peerId] || false;
-  const videoHidden = peerVideoHidden[peerId] || false;
-  return `
-    <button class="duo-ctrl-btn room-ctrl-audio ${audioMuted ? 'ctrl-active' : ''}" title="${audioMuted ? 'Unmute' : 'Mute'} audio">
-      ${audioMuted
-        ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`
-        : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`
-      }
-    </button>
-    <button class="duo-ctrl-btn room-ctrl-video ${videoHidden ? 'ctrl-active' : ''}" title="${videoHidden ? 'Show' : 'Hide'} video">
-      ${videoHidden
-        ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`
-        : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>`
-      }
-    </button>
-  `;
-}
-
-function togglePeerAudio(peerId) {
-  peerAudioMuted[peerId] = !peerAudioMuted[peerId];
-  const vid = $(`room-vid-${peerId}`);
-  if (vid) vid.muted = peerAudioMuted[peerId];
-  // Update overlay
-  const overlay = $(`overlay-${peerId}`);
-  if (overlay) overlay.innerHTML = buildPeerControls(peerId);
-  if (overlay) {
-    overlay.querySelector('.room-ctrl-audio').addEventListener('click', () => togglePeerAudio(peerId));
-    overlay.querySelector('.room-ctrl-video').addEventListener('click', () => togglePeerVideo(peerId));
+  // Attach remote stream if already available
+  if (partner && roomStreams[partner.socketId]) {
+    attachRemoteStream(partner.socketId, roomStreams[partner.socketId]);
   }
-  showToast(peerAudioMuted[peerId] ? '🔇 Audio muted' : '🔊 Audio on');
 }
 
-function togglePeerVideo(peerId) {
-  peerVideoHidden[peerId] = !peerVideoHidden[peerId];
-  const vid = $(`room-vid-${peerId}`);
-  if (vid) vid.style.opacity = peerVideoHidden[peerId] ? '0' : '1';
-  const overlay = $(`overlay-${peerId}`);
-  if (overlay) overlay.innerHTML = buildPeerControls(peerId);
-  if (overlay) {
-    overlay.querySelector('.room-ctrl-audio').addEventListener('click', () => togglePeerAudio(peerId));
-    overlay.querySelector('.room-ctrl-video').addEventListener('click', () => togglePeerVideo(peerId));
-  }
-  showToast(peerVideoHidden[peerId] ? '📷 Video hidden' : '📷 Video shown');
-}
-
-function togglePeerFullscreen(peerId) {
-  const fsOverlay = $('fullscreen-overlay');
-  if (fullscreenPeerId === peerId) {
-    // Exit fullscreen
-    exitFullscreen();
+// Toggle a panel to fullscreen / back to half-half
+function toggleFullscreen(panel) {
+  const layoutEl = roomVideoPanel;
+  if (fullscreenPanel === panel) {
+    // Already fullscreen → go back to half-half
+    layoutEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+    fullscreenPanel = null;
+    showToast('↩ Back to split view');
   } else {
-    // Enter fullscreen for this peer
-    fullscreenPeerId = peerId;
-    showFullscreenOverlay(peerId, false);
+    // Enter fullscreen
+    layoutEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+    layoutEl.classList.add(panel === 'big' ? 'fullscreen-big' : 'fullscreen-pip');
+    fullscreenPanel = panel;
+    showToast(panel === 'big' ? '🔍 Partner — fullscreen' : '🔍 Your video — fullscreen');
   }
 }
 
-function toggleLocalFullscreen() {
-  if (fullscreenPeerId === 'local') {
-    exitFullscreen();
-  } else {
-    fullscreenPeerId = 'local';
-    showFullscreenOverlay('local', true);
+let duoRemoteAudioMuted = false;
+let duoRemoteVideoHidden = false;
+
+function toggleDuoRemoteAudio() {
+  duoRemoteAudioMuted = !duoRemoteAudioMuted;
+  const vid = $('duo-big-vid');
+  const btn = $('duo-ctrl-audio');
+  if (vid) vid.muted = duoRemoteAudioMuted;
+  if (btn) {
+    btn.classList.toggle('ctrl-active', duoRemoteAudioMuted);
+    btn.title = duoRemoteAudioMuted ? 'Unmute partner audio' : 'Mute partner audio';
+    btn.innerHTML = duoRemoteAudioMuted
+      ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`
+      : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
   }
+  showToast(duoRemoteAudioMuted ? '🔇 Partner audio muted' : '🔊 Partner audio on');
 }
 
-function showFullscreenOverlay(peerId, isLocal) {
-  let fsOverlay = $('fullscreen-overlay');
-  if (!fsOverlay) {
-    fsOverlay = el('div', 'fullscreen-overlay');
-    fsOverlay.id = 'fullscreen-overlay';
-    document.body.appendChild(fsOverlay);
+function toggleDuoRemoteVideo() {
+  duoRemoteVideoHidden = !duoRemoteVideoHidden;
+  const vid = $('duo-big-vid');
+  const btn = $('duo-ctrl-video');
+  if (vid) { vid.style.opacity = duoRemoteVideoHidden ? '0' : '1'; }
+  if (btn) {
+    btn.classList.toggle('ctrl-active', duoRemoteVideoHidden);
+    btn.title = duoRemoteVideoHidden ? 'Show partner video' : 'Hide partner video';
+    btn.innerHTML = duoRemoteVideoHidden
+      ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`
+      : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>`;
   }
-  fsOverlay.innerHTML = '';
-  fsOverlay.style.display = 'flex';
-
-  const vid = el('video');
-  Object.assign(vid, { autoplay: true, playsInline: true });
-
-  if (isLocal) {
-    vid.srcObject = localStream || null;
-    vid.muted = true;
-  } else {
-    vid.srcObject = roomStreams[peerId] || null;
-    vid.muted = peerAudioMuted[peerId] || false;
-  }
-
-  // Name label
-  let name = 'YOU';
-  if (!isLocal) {
-    const member = roomMembers.find(m => m.socketId === peerId);
-    if (member) name = member.name.toUpperCase();
-  }
-  const lbl = el('div', 'fs-label'); lbl.textContent = name;
-
-  const hint = el('div', 'fs-hint'); hint.textContent = 'Double-tap to exit fullscreen';
-
-  fsOverlay.appendChild(vid);
-  fsOverlay.appendChild(lbl);
-  fsOverlay.appendChild(hint);
-
-  // Double tap/click exits
-  addDoubleTapListener(fsOverlay, () => exitFullscreen());
-  fsOverlay.addEventListener('click', (e) => {
-    // Single click: just show/hide hint briefly
-  });
-
-  showToast('🔍 Fullscreen — double-tap to exit');
+  showToast(duoRemoteVideoHidden ? '📷 Partner video hidden' : '📷 Partner video shown');
 }
 
-function exitFullscreen() {
-  fullscreenPeerId = null;
-  const fsOverlay = $('fullscreen-overlay');
-  if (fsOverlay) {
-    fsOverlay.style.display = 'none';
-    fsOverlay.innerHTML = '';
-  }
-  showToast('↩ Back to room view');
+function swapVideos() {
+  // Legacy compat — just toggle fullscreen of the swapped state
+  isVideoSwapped = !isVideoSwapped;
+  showToast(isVideoSwapped ? '↔ Swapped views' : '↔ Back to default');
 }
 
 function attachRemoteStream(peerId, stream) {
   roomStreams[peerId] = stream;
-  const vid = $(`room-vid-${peerId}`);
-  if (vid) {
-    vid.srcObject = stream;
-    vid.muted = peerAudioMuted[peerId] || false;
-    vid.style.opacity = peerVideoHidden[peerId] ? '0' : '1';
-    vid.play().catch(() => {});
-  }
-  // Also update fullscreen overlay if it's showing this peer
-  if (fullscreenPeerId === peerId) {
-    const fsOverlay = $('fullscreen-overlay');
-    if (fsOverlay) {
-      const fsvid = fsOverlay.querySelector('video');
-      if (fsvid) { fsvid.srcObject = stream; fsvid.play().catch(() => {}); }
-    }
-  }
+  // Always attach remote to duo-big-vid (left panel = partner)
+  const v = $('duo-big-vid');
+  if (v) { v.srcObject = stream; v.muted = duoRemoteAudioMuted; v.play().catch(() => {}); }
 }
 
-function updateConnIndicator(peerId, iceState) {
-  const dot = $(`conn-ind-${peerId}`);
+function updateConnIndicator(iceState) {
+  const dot = $('conn-indicator-main');
   if (!dot) return;
   dot.style.background =
     (iceState === 'connected' || iceState === 'completed') ? '#00ff88' :
@@ -786,12 +621,6 @@ function updateConnIndicator(peerId, iceState) {
 function scheduleLayout() {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => { buildLayout(); }, 120);
-}
-
-// ─── Legacy compat ───────────────────────────────────────────────────────────
-function swapVideos() {
-  // In multi-person mode, single click on a box focuses it.
-  showToast('↔ Click any box to focus');
 }
 
 // ─── DOM helpers ─────────────────────────────────────────────────────────────
@@ -860,20 +689,18 @@ function sendRoomMsg() {
 }
 
 // ─── Lobby ───────────────────────────────────────────────────────────────────
-function updateLobby(members, maxMembers) {
+function updateLobby(members) {
   roomMembers = members;
-  const max = maxMembers || selectedMaxMembers || 2;
+  const max = 2;
   if (lobbyMemberCount) lobbyMemberCount.textContent = members.length;
   if (lobbyMaxCount)    lobbyMaxCount.textContent    = max;
   const pct = Math.min(100, Math.round((members.length / max) * 100));
   if (lobbyAutostartFill) lobbyAutostartFill.style.width = pct + '%';
-  const remaining = 2 - members.length; // starts at 2
+  const remaining = max - members.length;
   if (lobbyStatusText) {
-    if (members.length >= 2) {
-      lobbyStatusText.textContent = 'SESSION STARTING…';
-    } else {
-      lobbyStatusText.textContent = `WAITING FOR ${2 - members.length} MORE PERSON${2 - members.length > 1 ? 'S' : ''}`;
-    }
+    lobbyStatusText.textContent = remaining > 0
+      ? 'WAITING FOR 1 MORE PERSON'
+      : 'BOTH PRESENT — STARTING…';
   }
   const frag = document.createDocumentFragment();
   members.forEach(m => {
@@ -884,13 +711,13 @@ function updateLobby(members, maxMembers) {
   lobbyMembersList.innerHTML = ''; lobbyMembersList.appendChild(frag);
 }
 
-// ─── Room Wait Screen ────────────────────────────────────────────────────────
-function showRoomWaitScreen(memberName) {
+// ─── Room Wait Screen (waiting for partner to rejoin) ────────────────────────
+function showRoomWaitScreen(partnerName) {
   const msgEl = $('room-wait-msg');
   const subEl = $('room-wait-sub');
   const ridEl = $('wait-room-id-display');
-  if (msgEl) msgEl.textContent = 'MEMBER DISCONNECTED';
-  if (subEl) subEl.textContent = `Waiting for ${memberName} to reconnect...`;
+  if (msgEl) msgEl.textContent = 'PARTNER DISCONNECTED';
+  if (subEl) subEl.textContent = `Waiting for ${partnerName} to reconnect...`;
   if (ridEl && currentRoomId) ridEl.textContent = currentRoomId;
   showScreen('roomWait');
 }
@@ -945,14 +772,17 @@ function initSocket() {
 
   socket.on('matched', async ({ partnerName, initiator }) => {
     partnerNameDisplay.textContent = partnerName.toUpperCase();
+    // Update stranger panel label
     const lbl = $('stranger-big-label');
     if (lbl) lbl.textContent = partnerName.toUpperCase();
 
+    // Re-attach local video if stream exists (important after skip)
     if (localStream && localVideo) {
       localVideo.srcObject = localStream;
       localVideo.muted = true;
     }
 
+    // Reset remote video state
     const remVid = $('remoteVideo');
     if (remVid) { remVid.style.opacity = '1'; remVid.srcObject = null; }
     if (remoteStatus) {
@@ -993,30 +823,29 @@ function initSocket() {
   socket.on('partner_left', () => {
     closePeerConnection();
     addSys('Stranger disconnected.');
+    // Reset remote video
     const remVid = $('remoteVideo');
     if (remVid) { remVid.style.opacity = '1'; }
     showModal();
   });
 
   // ══ Room events ════════════════════════════════════════════════════════════
-  socket.on('room_created', ({ roomId, name, members, maxMembers }) => {
+  socket.on('room_created', ({ roomId, name, members }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
-    selectedMaxMembers = maxMembers;
     if (lobbyRoomId) lobbyRoomId.textContent = roomId;
-    updateLobby(members, maxMembers);
-    showScreen('roomLobby'); showToast(`✓ Room ${roomId} created! (max ${maxMembers})`);
+    updateLobby(members);
+    showScreen('roomLobby'); showToast(`✓ Room ${roomId} created!`);
   });
 
-  socket.on('room_joined', ({ roomId, name, members, maxMembers, started }) => {
+  socket.on('room_joined', ({ roomId, name, members, started }) => {
     currentRoomId = roomId; myName = name; roomMembers = members;
     mySocketId = socket.id;
-    selectedMaxMembers = maxMembers || 2;
     if (lobbyRoomId) lobbyRoomId.textContent = roomId;
     if (started) {
       showToast('✓ Rejoined — reconnecting video…');
       startRoomSession(true);
     } else {
-      updateLobby(members, maxMembers); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
+      updateLobby(members); showScreen('roomLobby'); showToast(`✓ Joined room ${roomId}`);
     }
   });
 
@@ -1028,40 +857,34 @@ function initSocket() {
     }
   });
 
-  socket.on('room_auto_start', ({ members, maxMembers }) => {
+  socket.on('room_auto_start', ({ members }) => {
     roomMembers = members;
-    updateLobby(members, maxMembers);
+    updateLobby(members);
     setTimeout(() => startRoomSession(false), 500);
   });
 
-  socket.on('room_member_joined', ({ socketId, name, members, maxMembers, sessionActive }) => {
+  socket.on('room_member_joined', ({ socketId, name, members, sessionActive }) => {
     roomMembers = members;
-    updateLobby(members, maxMembers);
-    if (roomMemberCountEl) roomMemberCountEl.textContent = `${members.length}/${maxMembers || selectedMaxMembers}`;
+    updateLobby(members);
+    if (roomMemberCountEl) roomMemberCountEl.textContent = members.length;
     roomSys(`${name} joined`); showToast(`🟢 ${name} joined`);
 
     if (sessionActive && screens.roomChat.classList.contains('active')) {
-      // Connect WebRTC to new member
-      const newMember = members.find(m => m.socketId === socketId);
-      if (newMember && socketId !== mySocketId) {
-        // Request offer from all existing members
-        socket.emit('room_request_offer', { targetId: socketId });
-      }
       scheduleLayout();
     }
-    // If we were on wait screen and someone rejoined, start session
+    // If we were on wait screen and partner rejoined, start session
     if (screens.roomWait && screens.roomWait.classList.contains('active') && sessionActive) {
       showToast(`🟢 ${name} rejoined!`);
       startRoomSession(true);
     }
   });
 
-  socket.on('room_member_left', ({ socketId, name, members, maxMembers, newHost }) => {
+  socket.on('room_member_left', ({ socketId, name, members, newHost }) => {
     roomMembers = members;
-    if (roomMemberCountEl) roomMemberCountEl.textContent = `${members.length}/${maxMembers || selectedMaxMembers}`;
+    if (roomMemberCountEl) roomMemberCountEl.textContent = members.length;
     roomSys(`${name} left`); showToast(`🔴 ${name} left`);
 
-    // Clean up peer connection
+    // Clean up their peer connection
     if (roomPeers[socketId]) {
       const old = roomPeers[socketId];
       old.onicecandidate = old.ontrack = old.onconnectionstatechange =
@@ -1072,26 +895,18 @@ function initSocket() {
     delete roomStreams[socketId];
     delete iceQueue[socketId]; delete peerState[socketId];
     delete offerRetries[socketId]; delete pendingOffers[socketId];
-    delete peerAudioMuted[socketId]; delete peerVideoHidden[socketId];
-
-    // If focused peer left, reset focus
-    if (focusedPeerId === socketId) focusedPeerId = null;
-
-    if (screens.roomChat.classList.contains('active')) scheduleLayout();
   });
 
-  // Someone disconnected mid-session — they may rejoin
-  socket.on('room_member_disconnected', ({ leftName, roomId, remainingCount, maxMembers }) => {
-    // Keep session going, just update layout
-    showToast(`🔴 ${leftName} disconnected — may rejoin`, 4000);
-    // If only 1 person left and that's me, show wait screen
-    if (remainingCount === 1) {
-      const others = roomMembers.filter(m => m.socketId !== mySocketId);
-      if (others.length === 0) {
-        closeAllRoomPeers();
-        showRoomWaitScreen(leftName);
-      }
-    }
+  // FEATURE: Partner left, go to wait screen for rejoin
+  socket.on('partner_left_rejoin', ({ leftName, roomId, msg }) => {
+    showToast(`🔴 ${leftName} left`, 3000);
+    // Close existing peer connections but keep room alive
+    closeAllRoomPeers();
+    duoRemoteAudioMuted = false;
+    duoRemoteVideoHidden = false;
+    isVideoSwapped = false;
+    // Show wait screen
+    showRoomWaitScreen(leftName);
   });
 
   // ── room_offer ──────────────────────────────────────────────────────────────
@@ -1148,9 +963,11 @@ function initSocket() {
   socket.on('room_message', ({ from, text }) => roomMsg(text, 'received', from));
 
   socket.on('room_member_media', ({ socketId, audioMuted, videoOff }) => {
-    const vid = $(`room-vid-${socketId}`);
-    if (vid) {
-      if (audioMuted !== undefined) vid.muted = audioMuted;
+    // In duo layout there's only one remote stream
+    const v = isVideoSwapped ? $('duo-pip-vid') : $('duo-big-vid');
+    if (v) {
+      // Only update if this is actually the remote person
+      if (audioMuted !== undefined) v.muted = audioMuted;
     }
   });
 
@@ -1168,9 +985,10 @@ function initSocket() {
 // ─── Start / rejoin room session ─────────────────────────────────────────────
 async function startRoomSession(isRejoin = false) {
   if (roomIdDisplay) roomIdDisplay.textContent = currentRoomId;
-  if (roomMemberCountEl) roomMemberCountEl.textContent = `${roomMembers.length}/${selectedMaxMembers}`;
-  focusedPeerId = null;
-  fullscreenPeerId = null;
+  if (roomMemberCountEl) roomMemberCountEl.textContent = roomMembers.length;
+  duoRemoteAudioMuted = false;
+  duoRemoteVideoHidden = false;
+  isVideoSwapped = false;
 
   if (isRejoin) closeAllRoomPeers();
 
@@ -1209,11 +1027,8 @@ function cleanupRoom() {
   roomMuted        = false;
   roomCamOff       = false;
   isVideoSwapped   = false;
-  focusedPeerId    = null;
-  fullscreenPeerId = null;
-  for (const k of Object.keys(peerAudioMuted))  delete peerAudioMuted[k];
-  for (const k of Object.keys(peerVideoHidden)) delete peerVideoHidden[k];
-  exitFullscreen();
+  duoRemoteAudioMuted  = false;
+  duoRemoteVideoHidden = false;
 }
 
 // ─── Stranger chat ────────────────────────────────────────────────────────────
@@ -1260,13 +1075,21 @@ function toggleCamera() {
 }
 function skipStranger() {
   closePeerConnection();
+
+  // Reset all stranger-mode state
   strangerFullscreen = null;
   strangerRemoteAudioMuted = false;
   strangerRemoteVideoHidden = false;
+
+  // Reset video panel classes
   const panelEl = $('video-panel-stranger');
   if (panelEl) panelEl.classList.remove('fullscreen-big', 'fullscreen-pip');
+
+  // Reset remote video opacity
   const remVid = $('remoteVideo');
   if (remVid) { remVid.style.opacity = '1'; remVid.srcObject = null; }
+
+  // Reset mute/cam state and UI buttons
   isMuted = false; isCamOff = false;
   if (localStream) {
     localStream.getAudioTracks().forEach(t => { t.enabled = true; });
@@ -1286,11 +1109,16 @@ function skipStranger() {
     if (on)  on.style.display  = 'block';
     if (off) off.style.display = 'none';
   }
+
+  // Ensure local video is still showing (stream may still be live)
   if (localStream && localVideo) localVideo.srcObject = localStream;
+
+  // Reset remote status overlay
   if (remoteStatus) {
     remoteStatus.textContent = 'Connecting…';
     remoteStatus.classList.remove('hidden');
   }
+
   addSys('Searching for next stranger…');
   socket.emit('skip');
   showScreen('waiting');
@@ -1356,10 +1184,7 @@ async function startCreateRoomFlow() {
   lastRoomPassword = pass;
   await getLocalMedia();
   initSocket();
-  const go = () => {
-    mySocketId = socket.id;
-    socket.emit('create_room', { name, password: pass, maxMembers: selectedMaxMembers });
-  };
+  const go = () => { mySocketId = socket.id; socket.emit('create_room', { name, password: pass }); };
   socket.on('connect', go);
   if (socket.connected) go();
 }
@@ -1377,32 +1202,6 @@ async function startJoinRoomFlow() {
   const go = () => { mySocketId = socket.id; socket.emit('join_room', { roomId, password: pass, name }); };
   socket.on('connect', go);
   if (socket.connected) go();
-}
-
-// ─── Member selector ──────────────────────────────────────────────────────────
-function initMemberSelector() {
-  const display = $('member-count-display');
-  const btnMinus = $('btn-member-minus');
-  const btnPlus  = $('btn-member-plus');
-
-  if (!display || !btnMinus || !btnPlus) return;
-
-  function updateDisplay() {
-    display.textContent = selectedMaxMembers;
-    btnMinus.disabled = selectedMaxMembers <= 2;
-    btnPlus.disabled  = selectedMaxMembers >= 6;
-    btnMinus.style.opacity = selectedMaxMembers <= 2 ? '0.4' : '1';
-    btnPlus.style.opacity  = selectedMaxMembers >= 6 ? '0.4' : '1';
-  }
-
-  btnMinus.addEventListener('click', () => {
-    if (selectedMaxMembers > 2) { selectedMaxMembers--; updateDisplay(); }
-  });
-  btnPlus.addEventListener('click', () => {
-    if (selectedMaxMembers < 6) { selectedMaxMembers++; updateDisplay(); }
-  });
-
-  updateDisplay();
 }
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
@@ -1441,6 +1240,7 @@ $('btn-copy-room-id').addEventListener('click', () => {
   }
 });
 
+// Room wait screen leave button
 const btnRoomWaitLeave = $('btn-room-wait-leave');
 if (btnRoomWaitLeave) btnRoomWaitLeave.addEventListener('click', leaveRoom);
 
@@ -1469,19 +1269,18 @@ $('modal-next').addEventListener('click', () => {
 $('modal-home').addEventListener('click', () => { hideModal(); endSession(); });
 
 window.addEventListener('popstate', e => e.preventDefault());
-
-// Init member selector
-initMemberSelector();
-
 showScreen('landing');
 
-// ── Android keyboard layout fix ──
+// ── FIX: Android keyboard open/close pe layout shift nahi hoga ──
 (function () {
   if (!window.visualViewport) return;
   const IS_TOUCH = ('ontouchstart' in window);
   if (!IS_TOUCH) return;
+
+  // Keyboard open hone par chat-layout ki height fix rakho
   function onViewportResize() {
     const vh = window.visualViewport.height;
+    // Sirf chat screens pe apply karo
     const chatEl   = document.getElementById('screen-chat');
     const roomEl   = document.getElementById('screen-room-chat');
     const activeEl = (chatEl && chatEl.classList.contains('active')) ? chatEl
@@ -1490,8 +1289,10 @@ showScreen('landing');
     if (!activeEl) return;
     const layout = activeEl.querySelector('.chat-layout');
     if (!layout) return;
+    // Height set karo viewport ke hisab se — keyboard ke liye adjust hoga
     layout.style.height = vh + 'px';
   }
+
   window.visualViewport.addEventListener('resize', onViewportResize);
   window.visualViewport.addEventListener('scroll', onViewportResize);
 })();
