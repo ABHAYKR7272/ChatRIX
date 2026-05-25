@@ -38,10 +38,11 @@ const onlineCount  = { value: 0 };
 
 // roomId → {
 //   password, host, originalHost,
+//   maxMembers: 2-6,
 //   members:[{socketId,name}],
 //   started:bool,
-//   joinedIds:Set,    // all socket IDs ever seen (for reconnect)
-//   knownNames:Map    // name → socketId (tracks who has ever been in room)
+//   joinedIds:Set,
+//   knownNames:Map
 // }
 const rooms      = new Map();
 const roomTimers = new Map();
@@ -117,11 +118,12 @@ io.on('connection', (socket) => {
   });
 
   // ── Room: Create ────────────────────────────────────────────────────────────
-  // CHANGED: maxMembers always = 2, no selector
-  socket.on('create_room', ({ name, password }) => {
-    const safeName = String(name || '').trim().slice(0, 24) || 'Host';
-    const safePass = String(password || '').trim().slice(0, 32);
-    const roomId   = generateRoomId();
+  // maxMembers: 2-6 (user selected)
+  socket.on('create_room', ({ name, password, maxMembers }) => {
+    const safeName  = String(name || '').trim().slice(0, 24) || 'Host';
+    const safePass  = String(password || '').trim().slice(0, 32);
+    const safeMax   = Math.min(6, Math.max(2, parseInt(maxMembers) || 2));
+    const roomId    = generateRoomId();
     userNames.set(socket.id, safeName);
 
     const knownNames = new Map();
@@ -131,7 +133,7 @@ io.on('connection', (socket) => {
       password:     safePass,
       host:         socket.id,
       originalHost: socket.id,
-      maxMembers:   2,
+      maxMembers:   safeMax,
       members:      [{ socketId: socket.id, name: safeName }],
       started:      false,
       joinedIds:    new Set([socket.id]),
@@ -141,9 +143,9 @@ io.on('connection', (socket) => {
     socket.emit('room_created', {
       roomId, name: safeName,
       members: [{ socketId: socket.id, name: safeName }],
-      maxMembers: 2,
+      maxMembers: safeMax,
     });
-    console.log(`[ROOM] Created ${roomId} by ${safeName}`);
+    console.log(`[ROOM] Created ${roomId} by ${safeName} max=${safeMax}`);
   });
 
   // ── Room: Join ──────────────────────────────────────────────────────────────
@@ -157,9 +159,7 @@ io.on('connection', (socket) => {
 
     const isCurrentMember = room.members.some(m => m.socketId === socket.id);
     const wasEverMember   = room.joinedIds && room.joinedIds.has(socket.id);
-
-    // Check if this name was ever in the room (for creator/member returning with same name)
-    const isKnownName = room.knownNames && room.knownNames.has(safeName);
+    const isKnownName     = room.knownNames && room.knownNames.has(safeName);
 
     // Only truly new strangers are blocked after session started
     if (room.started && !isCurrentMember && !wasEverMember && !isKnownName) {
@@ -170,9 +170,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Full room check only for truly new joiners (not returning members)
+    // Full room check only for truly new joiners
     if (!isCurrentMember && !wasEverMember && !isKnownName && room.members.length >= room.maxMembers) {
-      socket.emit('room_error', { msg: 'Room is full (max 2)' });
+      socket.emit('room_error', { msg: `Room is full (max ${room.maxMembers})` });
       return;
     }
 
@@ -192,14 +192,11 @@ io.on('connection', (socket) => {
     if (room.knownNames) room.knownNames.set(safeName, socket.id);
     socket.join(roomId);
 
-    // If this is the original host rejoining, restore host role
-    // (name-based identification since socket ID changes on reconnect)
+    // Restore host if original host rejoins
     const origHostName = room.knownNames ? [...room.knownNames.entries()].find(([,id]) => id === room.originalHost)?.[0] : null;
     if (origHostName === safeName && room.host !== socket.id) {
-      // Check if original host is no longer connected
       const origSock = io.sockets.sockets.get(room.host);
       if (!origSock) {
-        // Original host reconnected — give them host back
         room.originalHost = socket.id;
         room.host = socket.id;
         console.log(`[ROOM] ${safeName} reclaimed host in ${roomId}`);
@@ -222,12 +219,12 @@ io.on('connection', (socket) => {
       sessionActive: room.started,
     });
 
-    console.log(`[ROOM] ${safeName}(${socket.id}) joined ${roomId} | members=${room.members.length}/2 started=${room.started}`);
+    console.log(`[ROOM] ${safeName}(${socket.id}) joined ${roomId} | members=${room.members.length}/${room.maxMembers} started=${room.started}`);
 
-    // Auto-start when both members present
-    if (!room.started && room.members.length >= room.maxMembers) {
+    // Auto-start when 2+ members present (session starts with minimum 2)
+    if (!room.started && room.members.length >= 2) {
       room.started = true;
-      console.log(`[ROOM] ${roomId} auto-starting — both members present`);
+      console.log(`[ROOM] ${roomId} auto-starting — 2+ members present`);
       setTimeout(() => {
         io.to(roomId).emit('room_auto_start', {
           members:    room.members,
@@ -359,32 +356,38 @@ function handleRoomLeave(socket) {
         socketId: socket.id,
         name: leftName,
         members: room.members,
+        maxMembers: room.maxMembers,
         newHost: room.host,
       });
 
-      // FEATURE: When one person leaves a 2-person room session,
-      // notify remaining person to go to waiting screen
-      if (room.started && room.members.length === 1) {
-        // Tell remaining member: partner left, go wait for them to rejoin
-        io.to(room.members[0].socketId).emit('partner_left_rejoin', {
+      // Notify remaining members that someone left (they can continue, rejoin is allowed)
+      if (room.started && room.members.length >= 1) {
+        io.to(roomId).emit('room_member_disconnected', {
           leftName,
           roomId,
-          msg: `${leftName} left. Waiting for them to rejoin…`,
+          remainingCount: room.members.length,
+          maxMembers: room.maxMembers,
         });
 
-        // Set a 5-min timer to close room if no one rejoins
-        if (roomTimers.has(roomId)) clearTimeout(roomTimers.get(roomId));
-        const timer = setTimeout(() => {
-          const r = rooms.get(roomId);
-          if (r && r.members.length <= 1) {
-            if (r.members.length === 1)
-              io.to(r.members[0].socketId).emit('room_closed', { msg: 'Room closed — partner did not rejoin.' });
-            rooms.delete(roomId);
-            roomTimers.delete(roomId);
-            console.log(`[ROOM] ${roomId} closed (timeout, partner never rejoined)`);
-          }
-        }, 5 * 60 * 1000);
-        roomTimers.set(roomId, timer);
+        // Set a 5-min timer to close room if drops to 0 members
+        if (room.members.length === 1 && roomTimers.has(roomId)) {
+          clearTimeout(roomTimers.get(roomId));
+          roomTimers.delete(roomId);
+        }
+        if (room.members.length <= 1) {
+          if (roomTimers.has(roomId)) clearTimeout(roomTimers.get(roomId));
+          const timer = setTimeout(() => {
+            const r = rooms.get(roomId);
+            if (r && r.members.length <= 1) {
+              if (r.members.length === 1)
+                io.to(r.members[0].socketId).emit('room_closed', { msg: 'Room closed — no one else rejoined.' });
+              rooms.delete(roomId);
+              roomTimers.delete(roomId);
+              console.log(`[ROOM] ${roomId} closed (timeout)`);
+            }
+          }, 5 * 60 * 1000);
+          roomTimers.set(roomId, timer);
+        }
       }
     }
     break;
