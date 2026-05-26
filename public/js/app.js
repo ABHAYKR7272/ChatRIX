@@ -188,23 +188,8 @@ function showToast(msg, ms = 2800) {
 // ─── Media ───────────────────────────────────────────────────────────────────
 const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-// ─── Helper: capture deviceId + facingMode from active stream ────────────────
-function captureCurrentCameraInfo() {
-  if (!localStream) return;
-  const vt = localStream.getVideoTracks()[0];
-  if (!vt) return;
-  try {
-    const s = vt.getSettings ? vt.getSettings() : {};
-    if (s.deviceId) currentVideoDeviceId = s.deviceId;
-    if (s.facingMode) currentFacingMode = s.facingMode;
-  } catch (_) {}
-}
-
 async function getLocalMedia() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-  // Reset camera state so captureCurrentCameraInfo re-reads fresh values
-  currentVideoDeviceId = null;
-  currentFacingMode = 'user';
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: IS_MOBILE
@@ -219,12 +204,10 @@ async function getLocalMedia() {
       },
     });
     localVideo.srcObject = localStream;
-    captureCurrentCameraInfo();
   } catch {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localVideo.srcObject = localStream;
-      captureCurrentCameraInfo();
     } catch {
       try {
         localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -359,183 +342,6 @@ function toggleStrangerVideo() {
       : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>`;
   }
   showToast(strangerRemoteVideoHidden ? '📷 Stranger video hidden' : '📷 Stranger video shown');
-}
-
-// ─── Camera Flip ─────────────────────────────────────────────────────────────
-let currentFacingMode = 'user'; // 'user' = front, 'environment' = back
-let isSwitchingCamera = false;
-let currentVideoDeviceId = null;
-
-async function switchCamera() {
-  if (isSwitchingCamera) return;
-
-  isSwitchingCamera = true;
-  const btn = $('local-ctrl-flip');
-  if (btn) btn.style.opacity = '0.5';
-
-  const nextFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
-
-  try {
-    const oldVideoTrack = localStream ? localStream.getVideoTracks()[0] : null;
-
-    // BUG FIX 1: Ensure we have the current deviceId captured (getSettings may
-    // return empty on Firefox / older browsers — so we try again here as safety net)
-    if (oldVideoTrack && !currentVideoDeviceId) {
-      captureCurrentCameraInfo();
-    }
-
-    let newStream = null;
-
-    // Strategy 1: facingMode exact (works on most mobile browsers)
-    try {
-      newStream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { exact: nextFacingMode },
-          width: { ideal: IS_MOBILE ? 640 : 1280 },
-          height: { ideal: IS_MOBILE ? 480 : 720 }
-        },
-        audio: false
-      });
-    } catch (e1) {
-      // Strategy 2: enumerate devices and pick by deviceId (works on desktop & some mobile)
-      try {
-        const allDevices = await navigator.mediaDevices.enumerateDevices();
-        // BUG FIX 2: filter out devices with empty deviceId (happens before permission grant)
-        const videoDevices = allDevices.filter(d => d.kind === 'videoinput' && d.deviceId && d.deviceId !== 'default');
-
-        if (videoDevices.length < 2) {
-          showToast('⚠ No other camera found');
-          isSwitchingCamera = false;
-          if (btn) btn.style.opacity = '';
-          return;
-        }
-
-        // BUG FIX 3: if currentVideoDeviceId is null/empty, find the first device
-        // whose ID differs from the active track's groupId, or just pick index 1
-        let currentIndex = videoDevices.findIndex(d => d.deviceId === currentVideoDeviceId);
-        if (currentIndex === -1) {
-          // Try to match by groupId as a fallback
-          if (oldVideoTrack) {
-            const settings = oldVideoTrack.getSettings ? oldVideoTrack.getSettings() : {};
-            const grp = settings.groupId;
-            if (grp) currentIndex = videoDevices.findIndex(d => d.groupId === grp);
-          }
-          // Still -1? Assume first device is current and pick second
-          if (currentIndex === -1) currentIndex = 0;
-        }
-        const nextIndex = (currentIndex + 1) % videoDevices.length;
-        const nextDeviceId = videoDevices[nextIndex].deviceId;
-
-        newStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            deviceId: { exact: nextDeviceId },
-            width: { ideal: IS_MOBILE ? 640 : 1280 },
-            height: { ideal: IS_MOBILE ? 480 : 720 }
-          },
-          audio: false
-        });
-      } catch (e2) {
-        // Strategy 3: facingMode as a hint only (last resort)
-        newStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: nextFacingMode,
-            width: { ideal: IS_MOBILE ? 640 : 1280 },
-            height: { ideal: IS_MOBILE ? 480 : 720 }
-          },
-          audio: false
-        });
-      }
-    }
-
-    if (!newStream) throw new Error('No stream obtained');
-
-    const newVideoTrack = newStream.getVideoTracks()[0];
-
-    // Update stored deviceId and facingMode
-    const newSettings = newVideoTrack.getSettings ? newVideoTrack.getSettings() : {};
-    currentVideoDeviceId = newSettings.deviceId || null;
-    currentFacingMode = newSettings.facingMode || nextFacingMode;
-
-    if (oldVideoTrack) oldVideoTrack.stop();
-
-    // Replace track in localStream
-    if (localStream) {
-      localStream.getVideoTracks().forEach(t => localStream.removeTrack(t));
-      localStream.addTrack(newVideoTrack);
-    } else {
-      localStream = newStream;
-    }
-
-    // Update local video element
-    const lv = $('localVideo');
-    if (lv) lv.srcObject = localStream;
-
-    // Replace track in active WebRTC peer connections (stranger)
-    if (peerConnection) {
-      const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (sender) await sender.replaceTrack(newVideoTrack);
-    }
-    // Replace track in room peer connections
-    for (const peerId of Object.keys(roomPeers)) {
-      const pc = roomPeers[peerId];
-      if (pc) {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-        if (sender) await sender.replaceTrack(newVideoTrack);
-      }
-    }
-
-    showToast(currentFacingMode === 'user' ? '📷 Front camera' : '📷 Back camera');
-  } catch (err) {
-    console.error('[CameraSwitch] all strategies failed:', err.name, err.message);
-    showToast('⚠ Camera switch failed');
-  } finally {
-    isSwitchingCamera = false;
-    if (btn) btn.style.opacity = '';
-  }
-}
-
-function setupLocalFlipButton() {
-  const flipBtn = $('local-ctrl-flip');
-  const localOverlay = $('local-overlay');
-  if (!flipBtn) return;
-
-  // Check if device has multiple cameras (or is mobile); show/hide accordingly
-  // BUG FIX 4: filter empty deviceIds — before permission grant, browsers return
-  // devices with empty deviceId/label, making the count unreliable.
-  // On mobile, ALWAYS show the flip button (every phone has front+back camera).
-  if (IS_MOBILE) {
-    if (localOverlay) localOverlay.style.display = '';
-  } else {
-    navigator.mediaDevices.enumerateDevices().then(devices => {
-      // Only count devices with real deviceIds (available after permission grant)
-      const videoCams = devices.filter(d => d.kind === 'videoinput' && d.deviceId && d.deviceId !== 'default');
-      if (videoCams.length < 2) {
-        // If camera is already active, re-enumerate (IDs populate after permission)
-        if (localStream) {
-          navigator.mediaDevices.enumerateDevices().then(d2 => {
-            const cams2 = d2.filter(d => d.kind === 'videoinput' && d.deviceId && d.deviceId !== 'default');
-            if (localOverlay) localOverlay.style.display = cams2.length >= 2 ? '' : 'none';
-          }).catch(() => {});
-        } else {
-          if (localOverlay) localOverlay.style.display = 'none';
-        }
-      } else {
-        if (localOverlay) localOverlay.style.display = '';
-      }
-    }).catch(() => {
-      // If we can't enumerate, show button anyway (safe default)
-    });
-  }
-
-  flipBtn.addEventListener('click', (e) => { e.stopPropagation(); switchCamera(); });
-  flipBtn.addEventListener('touchend', (e) => { e.stopPropagation(); });
-
-  // Prevent double-tap triggering fullscreen when tapping flip btn
-  if (localOverlay) {
-    localOverlay.addEventListener('click', e => e.stopPropagation());
-    localOverlay.addEventListener('dblclick', e => e.stopPropagation());
-    localOverlay.addEventListener('touchend', e => e.stopPropagation());
-  }
 }
 
 function closePeerConnection() {
@@ -728,13 +534,6 @@ function buildLayout() {
 
   const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
   pipBox.appendChild(pipLbl);
-
-  // Camera flip overlay for room local panel
-  const localOverlayRoom = el('div', 'duo-overlay'); localOverlayRoom.id = 'local-overlay';
-  const flipBtnRoom = el('button', 'duo-ctrl-btn'); flipBtnRoom.id = 'local-ctrl-flip'; flipBtnRoom.title = 'Switch Camera';
-  flipBtnRoom.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 7h-3a2 2 0 0 0-2-2h-6a2 2 0 0 0-2 2H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"></path><path d="M9 13a3 3 0 1 0 6 0 3 3 0 0 0-6 0"></path><path d="M15 3l2 2-2 2M9 3L7 5l2 2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
-  localOverlayRoom.appendChild(flipBtnRoom);
-  pipBox.appendChild(localOverlayRoom);
 
   // Double-click / double-tap local panel → fullscreen
   addDoubleTapListener(pipBox, () => toggleFullscreen('pip'));
@@ -994,7 +793,6 @@ function initSocket() {
     clearMsgs(); addSys(`Connected to ${partnerName}. Say hello!`);
     showScreen('chat');
     initStrangerPanel();
-    setupLocalFlipButton();
     await startCall(initiator);
   });
 
@@ -1196,7 +994,6 @@ async function startRoomSession(isRejoin = false) {
 
   showScreen('roomChat');
   buildLayout();
-  setupLocalFlipButton();
 
   roomSys(isRejoin ? 'Reconnecting video…' : 'Session started! Video connecting…');
   if (!isRejoin) socket.emit('room_start', { roomId: currentRoomId });
