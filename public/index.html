@@ -300,6 +300,16 @@
         <div class="video-box duo-pip local-box" id="stranger-pip-box">
           <video id="localVideo" autoplay playsinline muted></video>
           <div class="video-label local-label">YOU</div>
+          <!-- Camera flip overlay -->
+          <div class="duo-overlay" id="local-overlay">
+            <button class="duo-ctrl-btn" id="local-ctrl-flip" title="Switch Camera">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M20 7h-3a2 2 0 0 0-2-2h-6a2 2 0 0 0-2 2H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"></path>
+                <path d="M9 13a3 3 0 1 0 6 0 3 3 0 0 0-6 0"></path>
+                <path d="M15 3l2 2-2 2M9 3L7 5l2 2" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </button>
+          </div>
           <div class="video-corner tl"></div><div class="video-corner tr"></div>
           <div class="video-corner bl"></div><div class="video-corner br"></div>
         </div>
