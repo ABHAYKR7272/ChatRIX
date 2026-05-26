@@ -350,28 +350,78 @@ let isSwitchingCamera = false;
 
 async function switchCamera() {
   if (isSwitchingCamera) return;
-  // Only works on devices with multiple cameras
+
+  // Enumerate devices to find video inputs (labels available after permission granted)
   const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
   const videoDevices = devices.filter(d => d.kind === 'videoinput');
-  if (videoDevices.length < 2 && !IS_MOBILE) {
+
+  // On desktop, require at least 2 cameras detected; on mobile always allow (front/back)
+  if (!IS_MOBILE && videoDevices.length < 2) {
     showToast('⚠ No other camera found');
     return;
   }
+
   isSwitchingCamera = true;
   const btn = $('local-ctrl-flip');
   if (btn) btn.style.opacity = '0.5';
 
-  currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+  const nextFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
 
   try {
-    // Stop old video track only
     const oldVideoTrack = localStream ? localStream.getVideoTracks()[0] : null;
-    const audioTrack = localStream ? localStream.getAudioTracks()[0] : null;
 
-    const newStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: currentFacingMode, width: { ideal: IS_MOBILE ? 640 : 1280 }, height: { ideal: IS_MOBILE ? 480 : 720 } },
-      audio: false
-    });
+    let newStream = null;
+
+    if (IS_MOBILE) {
+      // On mobile: use { exact: facingMode } to force front/back switch
+      try {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { exact: nextFacingMode },
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          },
+          audio: false
+        });
+      } catch (exactErr) {
+        // Some browsers/devices don't support exact, fall back to ideal
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: nextFacingMode,
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          },
+          audio: false
+        });
+      }
+    } else {
+      // On desktop: cycle through available video devices by deviceId
+      const currentTrackSettings = oldVideoTrack ? oldVideoTrack.getSettings() : {};
+      const currentDeviceId = currentTrackSettings.deviceId || '';
+      // Find the next device in the list
+      const currentIndex = videoDevices.findIndex(d => d.deviceId === currentDeviceId);
+      const nextIndex = (currentIndex + 1) % videoDevices.length;
+      const nextDeviceId = videoDevices[nextIndex].deviceId;
+
+      newStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: nextDeviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+
+      // Update facingMode based on the new track's settings if available
+      const newSettings = newStream.getVideoTracks()[0].getSettings();
+      if (newSettings.facingMode) {
+        currentFacingMode = newSettings.facingMode;
+      } else {
+        currentFacingMode = nextFacingMode;
+      }
+    }
+
+    if (IS_MOBILE) currentFacingMode = nextFacingMode;
 
     const newVideoTrack = newStream.getVideoTracks()[0];
 
@@ -379,13 +429,14 @@ async function switchCamera() {
 
     // Replace track in localStream
     if (localStream) {
-      localStream.removeTrack(oldVideoTrack || localStream.getVideoTracks()[0]);
+      const tracksToRemove = localStream.getVideoTracks();
+      tracksToRemove.forEach(t => localStream.removeTrack(t));
       localStream.addTrack(newVideoTrack);
     } else {
       localStream = newStream;
     }
 
-    // Update video element
+    // Update local video element
     const lv = $('localVideo');
     if (lv) lv.srcObject = localStream;
 
@@ -405,7 +456,7 @@ async function switchCamera() {
 
     showToast(currentFacingMode === 'user' ? '📷 Front camera' : '📷 Back camera');
   } catch (err) {
-    currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user'; // revert
+    // revert facing mode on failure
     showToast('⚠ Camera switch failed');
   } finally {
     isSwitchingCamera = false;
