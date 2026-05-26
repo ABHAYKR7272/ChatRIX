@@ -347,74 +347,83 @@ function toggleStrangerVideo() {
 // ─── Camera Flip ─────────────────────────────────────────────────────────────
 let currentFacingMode = 'user'; // 'user' = front, 'environment' = back
 let isSwitchingCamera = false;
-let currentVideoDeviceId = null; // track current deviceId explicitly
+let currentVideoDeviceId = null;
 
 async function switchCamera() {
   if (isSwitchingCamera) return;
-
-  // Get all video input devices — after permission granted, these have real labels & deviceIds
-  let allDevices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
-  let videoDevices = allDevices.filter(d => d.kind === 'videoinput');
-
-  // If labels are empty (permission not yet recorded), try re-enumerating after a dummy getUserMedia
-  // This shouldn't happen since stream is already active, but safety net
-  if (videoDevices.length > 0 && !videoDevices[0].label) {
-    // Re-enumerate — labels should now be available since localStream is active
-    allDevices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
-    videoDevices = allDevices.filter(d => d.kind === 'videoinput');
-  }
-
-  if (videoDevices.length < 2) {
-    showToast('⚠ No other camera found');
-    return;
-  }
 
   isSwitchingCamera = true;
   const btn = $('local-ctrl-flip');
   if (btn) btn.style.opacity = '0.5';
 
+  const nextFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+
   try {
     const oldVideoTrack = localStream ? localStream.getVideoTracks()[0] : null;
 
-    // Get current deviceId from active track if not stored yet
-    if (!currentVideoDeviceId && oldVideoTrack) {
-      currentVideoDeviceId = oldVideoTrack.getSettings().deviceId || null;
+    // Track current deviceId from active stream
+    if (oldVideoTrack && !currentVideoDeviceId) {
+      currentVideoDeviceId = (oldVideoTrack.getSettings() || {}).deviceId || null;
     }
 
-    // Find current index, pick next device
-    const currentIndex = videoDevices.findIndex(d => d.deviceId === currentVideoDeviceId);
-    const nextIndex = (currentIndex + 1) % videoDevices.length;
-    const nextDevice = videoDevices[nextIndex];
+    let newStream = null;
 
-    // Request new stream using explicit deviceId — works on ALL browsers/devices
-    const newStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        deviceId: { exact: nextDevice.deviceId },
-        width: { ideal: IS_MOBILE ? 640 : 1280 },
-        height: { ideal: IS_MOBILE ? 480 : 720 }
-      },
-      audio: false
-    });
+    // Strategy 1: facingMode exact (best for mobile browsers)
+    try {
+      newStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { exact: nextFacingMode },
+          width: { ideal: IS_MOBILE ? 640 : 1280 },
+          height: { ideal: IS_MOBILE ? 480 : 720 }
+        },
+        audio: false
+      });
+    } catch (e1) {
+      // Strategy 2: enumerate devices and pick by deviceId (works on desktop & some mobile)
+      try {
+        const allDevices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = allDevices.filter(d => d.kind === 'videoinput');
+
+        if (videoDevices.length < 2) {
+          showToast('⚠ No other camera found');
+          isSwitchingCamera = false;
+          if (btn) btn.style.opacity = '';
+          return;
+        }
+
+        const currentIndex = videoDevices.findIndex(d => d.deviceId === currentVideoDeviceId);
+        const nextIndex = (currentIndex + 1) % videoDevices.length;
+        const nextDeviceId = videoDevices[nextIndex].deviceId;
+
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            deviceId: { exact: nextDeviceId },
+            width: { ideal: IS_MOBILE ? 640 : 1280 },
+            height: { ideal: IS_MOBILE ? 480 : 720 }
+          },
+          audio: false
+        });
+      } catch (e2) {
+        // Strategy 3: facingMode without exact (last resort)
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: nextFacingMode,
+            width: { ideal: IS_MOBILE ? 640 : 1280 },
+            height: { ideal: IS_MOBILE ? 480 : 720 }
+          },
+          audio: false
+        });
+      }
+    }
+
+    if (!newStream) throw new Error('No stream obtained');
 
     const newVideoTrack = newStream.getVideoTracks()[0];
 
-    // Store new deviceId
-    currentVideoDeviceId = newVideoTrack.getSettings().deviceId || nextDevice.deviceId;
-
-    // Update facingMode from track settings if available, else guess from label
-    const settings = newVideoTrack.getSettings();
-    if (settings.facingMode) {
-      currentFacingMode = settings.facingMode;
-    } else {
-      const label = (nextDevice.label || '').toLowerCase();
-      if (label.includes('back') || label.includes('rear') || label.includes('environment')) {
-        currentFacingMode = 'environment';
-      } else if (label.includes('front') || label.includes('user') || label.includes('face')) {
-        currentFacingMode = 'user';
-      } else {
-        currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
-      }
-    }
+    // Update stored deviceId and facingMode
+    const newSettings = newVideoTrack.getSettings ? newVideoTrack.getSettings() : {};
+    currentVideoDeviceId = newSettings.deviceId || null;
+    currentFacingMode = newSettings.facingMode || nextFacingMode;
 
     if (oldVideoTrack) oldVideoTrack.stop();
 
@@ -446,7 +455,7 @@ async function switchCamera() {
 
     showToast(currentFacingMode === 'user' ? '📷 Front camera' : '📷 Back camera');
   } catch (err) {
-    console.error('[CameraSwitch] failed:', err);
+    console.error('[CameraSwitch] all strategies failed:', err.name, err.message);
     showToast('⚠ Camera switch failed');
   } finally {
     isSwitchingCamera = false;
@@ -459,15 +468,17 @@ function setupLocalFlipButton() {
   const localOverlay = $('local-overlay');
   if (!flipBtn) return;
 
-  // Show/hide flip button based on available cameras
+  // Check if device has multiple cameras (or is mobile); show/hide accordingly
   navigator.mediaDevices.enumerateDevices().then(devices => {
     const videoCams = devices.filter(d => d.kind === 'videoinput');
-    // On mobile always show; on desktop hide only if labels available and confirmed single camera
-    const hasLabels = videoCams.some(d => d.label !== '');
-    const shouldHide = !IS_MOBILE && hasLabels && videoCams.length < 2;
-    if (localOverlay) localOverlay.style.display = shouldHide ? 'none' : '';
+    // Show on mobile always (front/back), on desktop only if 2+ cameras
+    if (!IS_MOBILE && videoCams.length < 2) {
+      if (localOverlay) localOverlay.style.display = 'none';
+    } else {
+      if (localOverlay) localOverlay.style.display = '';
+    }
   }).catch(() => {
-    if (localOverlay) localOverlay.style.display = '';
+    // If we can't enumerate, show button anyway (safe default)
   });
 
   flipBtn.addEventListener('click', (e) => { e.stopPropagation(); switchCamera(); });
