@@ -344,6 +344,104 @@ function toggleStrangerVideo() {
   showToast(strangerRemoteVideoHidden ? '📷 Stranger video hidden' : '📷 Stranger video shown');
 }
 
+// ─── Camera Flip ─────────────────────────────────────────────────────────────
+let currentFacingMode = 'user'; // 'user' = front, 'environment' = back
+let isSwitchingCamera = false;
+
+async function switchCamera() {
+  if (isSwitchingCamera) return;
+  // Only works on devices with multiple cameras
+  const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+  const videoDevices = devices.filter(d => d.kind === 'videoinput');
+  if (videoDevices.length < 2 && !IS_MOBILE) {
+    showToast('⚠ No other camera found');
+    return;
+  }
+  isSwitchingCamera = true;
+  const btn = $('local-ctrl-flip');
+  if (btn) btn.style.opacity = '0.5';
+
+  currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+
+  try {
+    // Stop old video track only
+    const oldVideoTrack = localStream ? localStream.getVideoTracks()[0] : null;
+    const audioTrack = localStream ? localStream.getAudioTracks()[0] : null;
+
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: currentFacingMode, width: { ideal: IS_MOBILE ? 640 : 1280 }, height: { ideal: IS_MOBILE ? 480 : 720 } },
+      audio: false
+    });
+
+    const newVideoTrack = newStream.getVideoTracks()[0];
+
+    if (oldVideoTrack) oldVideoTrack.stop();
+
+    // Replace track in localStream
+    if (localStream) {
+      localStream.removeTrack(oldVideoTrack || localStream.getVideoTracks()[0]);
+      localStream.addTrack(newVideoTrack);
+    } else {
+      localStream = newStream;
+    }
+
+    // Update video element
+    const lv = $('localVideo');
+    if (lv) lv.srcObject = localStream;
+
+    // Replace track in active WebRTC peer connections (stranger)
+    if (peerConnection) {
+      const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender) await sender.replaceTrack(newVideoTrack);
+    }
+    // Replace track in room peer connections
+    for (const peerId of Object.keys(roomPeers)) {
+      const pc = roomPeers[peerId];
+      if (pc) {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(newVideoTrack);
+      }
+    }
+
+    showToast(currentFacingMode === 'user' ? '📷 Front camera' : '📷 Back camera');
+  } catch (err) {
+    currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user'; // revert
+    showToast('⚠ Camera switch failed');
+  } finally {
+    isSwitchingCamera = false;
+    if (btn) btn.style.opacity = '';
+  }
+}
+
+function setupLocalFlipButton() {
+  const flipBtn = $('local-ctrl-flip');
+  const localOverlay = $('local-overlay');
+  if (!flipBtn) return;
+
+  // Check if device has multiple cameras (or is mobile); show/hide accordingly
+  navigator.mediaDevices.enumerateDevices().then(devices => {
+    const videoCams = devices.filter(d => d.kind === 'videoinput');
+    // Show on mobile always (front/back), on desktop only if 2+ cameras
+    if (!IS_MOBILE && videoCams.length < 2) {
+      if (localOverlay) localOverlay.style.display = 'none';
+    } else {
+      if (localOverlay) localOverlay.style.display = '';
+    }
+  }).catch(() => {
+    // If we can't enumerate, show button anyway (safe default)
+  });
+
+  flipBtn.addEventListener('click', (e) => { e.stopPropagation(); switchCamera(); });
+  flipBtn.addEventListener('touchend', (e) => { e.stopPropagation(); });
+
+  // Prevent double-tap triggering fullscreen when tapping flip btn
+  if (localOverlay) {
+    localOverlay.addEventListener('click', e => e.stopPropagation());
+    localOverlay.addEventListener('dblclick', e => e.stopPropagation());
+    localOverlay.addEventListener('touchend', e => e.stopPropagation());
+  }
+}
+
 function closePeerConnection() {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
   remoteVideo.srcObject = null;
@@ -534,6 +632,13 @@ function buildLayout() {
 
   const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
   pipBox.appendChild(pipLbl);
+
+  // Camera flip overlay for room local panel
+  const localOverlayRoom = el('div', 'duo-overlay'); localOverlayRoom.id = 'local-overlay';
+  const flipBtnRoom = el('button', 'duo-ctrl-btn'); flipBtnRoom.id = 'local-ctrl-flip'; flipBtnRoom.title = 'Switch Camera';
+  flipBtnRoom.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 7h-3a2 2 0 0 0-2-2h-6a2 2 0 0 0-2 2H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"></path><path d="M9 13a3 3 0 1 0 6 0 3 3 0 0 0-6 0"></path><path d="M15 3l2 2-2 2M9 3L7 5l2 2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
+  localOverlayRoom.appendChild(flipBtnRoom);
+  pipBox.appendChild(localOverlayRoom);
 
   // Double-click / double-tap local panel → fullscreen
   addDoubleTapListener(pipBox, () => toggleFullscreen('pip'));
@@ -793,6 +898,7 @@ function initSocket() {
     clearMsgs(); addSys(`Connected to ${partnerName}. Say hello!`);
     showScreen('chat');
     initStrangerPanel();
+    setupLocalFlipButton();
     await startCall(initiator);
   });
 
@@ -994,6 +1100,7 @@ async function startRoomSession(isRejoin = false) {
 
   showScreen('roomChat');
   buildLayout();
+  setupLocalFlipButton();
 
   roomSys(isRejoin ? 'Reconnecting video…' : 'Session started! Video connecting…');
   if (!isRejoin) socket.emit('room_start', { roomId: currentRoomId });
