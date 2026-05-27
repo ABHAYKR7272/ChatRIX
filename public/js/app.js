@@ -188,18 +188,13 @@ function showToast(msg, ms = 2800) {
 // ─── Media ───────────────────────────────────────────────────────────────────
 const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-// Track current camera facing mode and device id (for switching)
-let currentFacingMode = 'user';
-let currentVideoDeviceId = null;
-let isSwitchingCamera = false;
-
 async function getLocalMedia() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: IS_MOBILE
-        ? { facingMode: currentFacingMode, width: { ideal: 640 }, height: { ideal: 480 } }
-        : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: currentFacingMode },
+        ? { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+        : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 }, facingMode: 'user' },
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -209,21 +204,10 @@ async function getLocalMedia() {
       },
     });
     localVideo.srcObject = localStream;
-    const vTrack = localStream.getVideoTracks()[0];
-    if (vTrack) {
-      const settings = vTrack.getSettings ? vTrack.getSettings() : {};
-      if (settings.deviceId) currentVideoDeviceId = settings.deviceId;
-      if (settings.facingMode) currentFacingMode = settings.facingMode;
-    }
   } catch {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localVideo.srcObject = localStream;
-      const vTrack = localStream.getVideoTracks()[0];
-      if (vTrack) {
-        const settings = vTrack.getSettings ? vTrack.getSettings() : {};
-        if (settings.deviceId) currentVideoDeviceId = settings.deviceId;
-      }
     } catch {
       try {
         localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -240,131 +224,6 @@ async function getLocalMedia() {
 function stopLocalMedia() {
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   localVideo.srcObject = null;
-}
-
-// ─── Camera switch (front/back on mobile, cycle devices on desktop) ──────────
-async function listVideoInputDevices() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices.filter(d => d.kind === 'videoinput');
-  } catch { return []; }
-}
-
-async function switchCamera() {
-  if (isSwitchingCamera) return;
-  if (!localStream) { showToast('⚠ No camera available'); return; }
-  const oldVideoTracks = localStream.getVideoTracks();
-  if (!oldVideoTracks.length) { showToast('⚠ No camera available'); return; }
-
-  isSwitchingCamera = true;
-
-  // Decide next camera: prefer facingMode toggle on mobile, else cycle deviceId on desktop
-  const targetFacing = currentFacingMode === 'user' ? 'environment' : 'user';
-  let newStream = null;
-  let usedFacing = null;
-  let usedDeviceId = null;
-
-  const videoDevices = await listVideoInputDevices();
-
-  // Strategy 1: try facingMode toggle (works best on mobile / Android WebView)
-  try {
-    newStream = await navigator.mediaDevices.getUserMedia({
-      video: IS_MOBILE
-        ? { facingMode: { exact: targetFacing }, width: { ideal: 640 }, height: { ideal: 480 } }
-        : { facingMode: { exact: targetFacing }, width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false,
-    });
-    usedFacing = targetFacing;
-  } catch {
-    // Strategy 2: enumerate devices and pick a different one (desktop, multi-cam laptops)
-    if (videoDevices.length >= 2) {
-      const currentIdx = Math.max(0, videoDevices.findIndex(d => d.deviceId === currentVideoDeviceId));
-      const nextIdx = (currentIdx + 1) % videoDevices.length;
-      const nextDevice = videoDevices[nextIdx];
-      try {
-        newStream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: nextDevice.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: false,
-        });
-        usedDeviceId = nextDevice.deviceId;
-      } catch (e2) {
-        console.warn('[switchCamera] device-id fallback failed:', e2);
-      }
-    }
-
-    // Strategy 3: last resort — facingMode without 'exact'
-    if (!newStream) {
-      try {
-        newStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: targetFacing },
-          audio: false,
-        });
-        usedFacing = targetFacing;
-      } catch (e3) {
-        console.warn('[switchCamera] facingMode loose fallback failed:', e3);
-      }
-    }
-  }
-
-  if (!newStream) {
-    isSwitchingCamera = false;
-    showToast(videoDevices.length < 2 ? '⚠ Only one camera available' : '⚠ Could not switch camera');
-    return;
-  }
-
-  const newVideoTrack = newStream.getVideoTracks()[0];
-  if (!newVideoTrack) {
-    isSwitchingCamera = false;
-    showToast('⚠ Could not switch camera');
-    return;
-  }
-
-  // Preserve enabled state (camera on/off toggles)
-  const wasCamOff = isCamOff || roomCamOff;
-  newVideoTrack.enabled = !wasCamOff;
-
-  // Replace track on all active peer connections (stranger + room)
-  try {
-    if (peerConnection) {
-      const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (sender) await sender.replaceTrack(newVideoTrack);
-    }
-  } catch (e) { console.warn('[switchCamera] stranger replaceTrack failed:', e); }
-
-  for (const pc of Object.values(roomPeers)) {
-    try {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (sender) await sender.replaceTrack(newVideoTrack);
-    } catch (e) { console.warn('[switchCamera] room replaceTrack failed:', e); }
-  }
-
-  // Swap track inside our localStream object (keep same MediaStream reference, just rotate video track)
-  oldVideoTracks.forEach(t => {
-    try { localStream.removeTrack(t); } catch {}
-    try { t.stop(); } catch {}
-  });
-  localStream.addTrack(newVideoTrack);
-
-  // Update settings cache
-  const settings = newVideoTrack.getSettings ? newVideoTrack.getSettings() : {};
-  if (usedFacing) currentFacingMode = usedFacing;
-  else if (settings.facingMode) currentFacingMode = settings.facingMode;
-  if (usedDeviceId) currentVideoDeviceId = usedDeviceId;
-  else if (settings.deviceId) currentVideoDeviceId = settings.deviceId;
-
-  // Refresh all preview video elements showing local stream
-  const previewIds = ['localVideo', 'duo-pip-vid'];
-  previewIds.forEach(id => {
-    const v = document.getElementById(id);
-    if (v) {
-      v.srcObject = localStream;
-      v.muted = true;
-      v.play().catch(() => {});
-    }
-  });
-
-  isSwitchingCamera = false;
-  showToast(currentFacingMode === 'environment' ? '🔄 Switched to back camera' : '🔄 Switched to front camera');
 }
 
 // ─── WebRTC: Stranger ────────────────────────────────────────────────────────
@@ -412,8 +271,6 @@ function initStrangerPanel() {
   const overlay = $('stranger-overlay');
   const audioBtn = $('stranger-ctrl-audio');
   const videoBtn = $('stranger-ctrl-video');
-  const localOverlay = $('stranger-local-overlay');
-  const switchCamBtn = $('stranger-ctrl-switch-cam');
 
   if (!bigBox || !pipBox || !panel) return;
 
@@ -423,21 +280,13 @@ function initStrangerPanel() {
     toggleStrangerFullscreen('big');
   });
   // Double-tap/click on local → fullscreen
-  addDoubleTapListener(pipBox, (e) => {
-    if (e.target && e.target.closest('.duo-ctrl-btn')) return;
-    toggleStrangerFullscreen('pip');
-  });
+  addDoubleTapListener(pipBox, () => toggleStrangerFullscreen('pip'));
 
   // Overlay stop propagation
   if (overlay) {
     overlay.addEventListener('click', e => e.stopPropagation());
     overlay.addEventListener('dblclick', e => e.stopPropagation());
     overlay.addEventListener('touchend', e => e.stopPropagation());
-  }
-  if (localOverlay) {
-    localOverlay.addEventListener('click', e => e.stopPropagation());
-    localOverlay.addEventListener('dblclick', e => e.stopPropagation());
-    localOverlay.addEventListener('touchend', e => e.stopPropagation());
   }
 
   if (audioBtn) {
@@ -447,10 +296,6 @@ function initStrangerPanel() {
   if (videoBtn) {
     videoBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleStrangerVideo(); });
     videoBtn.addEventListener('touchend', (e) => e.stopPropagation());
-  }
-  if (switchCamBtn) {
-    switchCamBtn.addEventListener('click', (e) => { e.stopPropagation(); switchCamera(); });
-    switchCamBtn.addEventListener('touchend', (e) => e.stopPropagation());
   }
 }
 
@@ -690,33 +535,8 @@ function buildLayout() {
   const pipLbl = el('div', 'video-label local-label'); pipLbl.id = 'duo-pip-label'; pipLbl.textContent = 'YOU';
   pipBox.appendChild(pipLbl);
 
-  // Local overlay: switch camera (front/back) — top-right of local PIP panel
-  const localOverlay = el('div', 'duo-overlay local-overlay'); localOverlay.id = 'duo-local-overlay';
-  localOverlay.innerHTML = `
-    <button class="duo-ctrl-btn" id="duo-ctrl-switch-cam" data-testid="duo-switch-camera-btn" title="Switch camera" aria-label="Switch camera">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-        <path d="M20 7h-3.2l-1.4-2.1a2 2 0 0 0-1.7-.9h-3.4a2 2 0 0 0-1.7.9L7.2 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"></path>
-        <path d="M8.5 13.5h7"></path>
-        <polyline points="10.5 11.5 8.5 13.5 10.5 15.5"></polyline>
-        <polyline points="13.5 11.5 15.5 13.5 13.5 15.5"></polyline>
-      </svg>
-    </button>
-  `;
-  pipBox.appendChild(localOverlay);
-  localOverlay.addEventListener('click', e => e.stopPropagation());
-  localOverlay.addEventListener('dblclick', e => e.stopPropagation());
-  localOverlay.addEventListener('touchend', e => e.stopPropagation());
-  const duoSwitchBtn = localOverlay.querySelector('#duo-ctrl-switch-cam');
-  if (duoSwitchBtn) {
-    duoSwitchBtn.addEventListener('click', (e) => { e.stopPropagation(); switchCamera(); });
-    duoSwitchBtn.addEventListener('touchend', (e) => { e.stopPropagation(); });
-  }
-
   // Double-click / double-tap local panel → fullscreen
-  addDoubleTapListener(pipBox, (e) => {
-    if (e.target && e.target.closest('.duo-ctrl-btn')) return;
-    toggleFullscreen('pip');
-  });
+  addDoubleTapListener(pipBox, () => toggleFullscreen('pip'));
 
   corners(pipBox);
   roomVideoPanel.appendChild(pipBox);
@@ -1476,3 +1296,214 @@ showScreen('landing');
   window.visualViewport.addEventListener('resize', onViewportResize);
   window.visualViewport.addEventListener('scroll', onViewportResize);
 })();
+
+// ─── Screen Share Feature ──────────────────────────────────────────────────
+let screenShareStream    = null;   // capture stream (screen + system audio)
+let screenShareActive    = false;
+let screenShareMixedStream = null; // mixed: screen video + mic + system audio
+
+// Open the screen share modal
+function openScreenShareModal() {
+  const modal = $('screenshare-modal');
+  if (modal) modal.style.display = 'flex';
+}
+
+// Close the screen share modal
+function closeScreenShareModal() {
+  const modal = $('screenshare-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+// Start screen share — mode: 'screen' | 'window'
+async function startScreenShare(preferType) {
+  closeScreenShareModal();
+
+  if (screenShareActive) {
+    stopScreenShare();
+    return;
+  }
+
+  // getDisplayMedia options — browser will show its native picker
+  // preferCurrentTab: false so user can pick screen or window
+  const displayOpts = {
+    video: {
+      cursor: 'always',
+      displaySurface: preferType === 'window' ? 'window' : 'monitor',
+    },
+    audio: {
+      // Request system/tab audio capture
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl:  false,
+    },
+    selfBrowserSurface: 'exclude',
+    systemAudio: 'include',
+    surfaceSwitching: 'include',
+    preferCurrentTab: false,
+  };
+
+  let captureStream;
+  try {
+    captureStream = await navigator.mediaDevices.getDisplayMedia(displayOpts);
+  } catch (err) {
+    if (err.name !== 'NotAllowedError') showToast('⚠ Screen share failed: ' + err.message);
+    return;
+  }
+
+  screenShareStream = captureStream;
+
+  // Mix: screen video + system audio (from capture) + mic audio (from localStream)
+  const audioCtx    = new (window.AudioContext || window.webkitAudioContext)();
+  const destination = audioCtx.createMediaStreamDestination();
+
+  // Add system/tab audio if captured
+  const sysAudioTracks = captureStream.getAudioTracks();
+  if (sysAudioTracks.length > 0) {
+    const sysSource = audioCtx.createMediaStreamSource(new MediaStream(sysAudioTracks));
+    sysSource.connect(destination);
+  }
+
+  // Add mic audio
+  if (localStream && localStream.getAudioTracks().length > 0) {
+    const micSource = audioCtx.createMediaStreamSource(new MediaStream(localStream.getAudioTracks()));
+    micSource.connect(destination);
+  }
+
+  // Build the mixed stream: screen video + mixed audio
+  const screenVideoTrack = captureStream.getVideoTracks()[0];
+  const mixedAudioTrack  = destination.stream.getAudioTracks()[0];
+
+  const tracks = [screenVideoTrack];
+  if (mixedAudioTrack) tracks.push(mixedAudioTrack);
+  screenShareMixedStream = new MediaStream(tracks);
+
+  // Replace video track in all active peer connections
+  const newVideoTrack = screenVideoTrack;
+
+  // Stranger mode
+  if (peerConnection) {
+    const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(newVideoTrack).catch(console.warn);
+  }
+
+  // Room mode — all room peers
+  for (const [peerId, pc] of Object.entries(roomPeers)) {
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(newVideoTrack).catch(console.warn);
+    // Also replace audio with mixed
+    if (mixedAudioTrack) {
+      const aSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+      if (aSender) await aSender.replaceTrack(mixedAudioTrack).catch(console.warn);
+    }
+  }
+
+  // Replace stranger audio too
+  if (peerConnection && mixedAudioTrack) {
+    const aSender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
+    if (aSender) await aSender.replaceTrack(mixedAudioTrack).catch(console.warn);
+  }
+
+  // Show screen share in local preview
+  if (localVideo) localVideo.srcObject = screenShareMixedStream;
+  const pipVid = $('duo-pip-vid');
+  if (pipVid) pipVid.srcObject = screenShareMixedStream;
+
+  screenShareActive = true;
+  updateShareBtnUI(true);
+  showToast('🖥 Screen sharing started');
+
+  // When user stops share via browser's native stop button
+  screenVideoTrack.onended = () => {
+    stopScreenShare();
+  };
+}
+
+// Stop screen share — restore camera
+async function stopScreenShare() {
+  if (!screenShareActive) return;
+
+  // Stop all capture tracks
+  if (screenShareStream) {
+    screenShareStream.getTracks().forEach(t => t.stop());
+    screenShareStream = null;
+  }
+  screenShareMixedStream = null;
+  screenShareActive = false;
+
+  // Restore original camera track
+  if (localStream) {
+    const origVideoTrack = localStream.getVideoTracks()[0];
+    const origAudioTrack = localStream.getAudioTracks()[0];
+
+    if (origVideoTrack) {
+      if (peerConnection) {
+        const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(origVideoTrack).catch(console.warn);
+      }
+      for (const [, pc] of Object.entries(roomPeers)) {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) await sender.replaceTrack(origVideoTrack).catch(console.warn);
+      }
+    }
+    if (origAudioTrack) {
+      if (peerConnection) {
+        const aSender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (aSender) await aSender.replaceTrack(origAudioTrack).catch(console.warn);
+      }
+      for (const [, pc] of Object.entries(roomPeers)) {
+        const aSender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (aSender) await aSender.replaceTrack(origAudioTrack).catch(console.warn);
+      }
+    }
+
+    // Restore local preview
+    if (localVideo) localVideo.srcObject = localStream;
+    const pipVid = $('duo-pip-vid');
+    if (pipVid) pipVid.srcObject = localStream;
+  }
+
+  updateShareBtnUI(false);
+  showToast('🖥 Screen sharing stopped');
+}
+
+// Update SHARE button appearance on both screens
+function updateShareBtnUI(isActive) {
+  ['btn-screenshare', 'btn-room-screenshare'].forEach(id => {
+    const btn = $(id);
+    if (!btn) return;
+    btn.classList.toggle('active', isActive);
+    const off = btn.querySelector('.icon-share-off');
+    const on  = btn.querySelector('.icon-share-on');
+    if (off) off.style.display = isActive ? 'none'  : 'block';
+    if (on)  on.style.display  = isActive ? 'block' : 'none';
+  });
+}
+
+// Modal buttons
+const ssEntireBtn = $('ss-entire-screen');
+const ssSingleBtn = $('ss-single-app');
+const ssCancelBtn = $('ss-cancel');
+if (ssEntireBtn) ssEntireBtn.addEventListener('click', () => startScreenShare('screen'));
+if (ssSingleBtn) ssSingleBtn.addEventListener('click', () => startScreenShare('window'));
+if (ssCancelBtn) ssCancelBtn.addEventListener('click',  closeScreenShareModal);
+
+// Trigger buttons — if already sharing, clicking again stops it
+const btnShareStranger = $('btn-screenshare');
+const btnShareRoom     = $('btn-room-screenshare');
+if (btnShareStranger) btnShareStranger.addEventListener('click', () => {
+  if (screenShareActive) stopScreenShare();
+  else openScreenShareModal();
+});
+if (btnShareRoom) btnShareRoom.addEventListener('click', () => {
+  if (screenShareActive) stopScreenShare();
+  else openScreenShareModal();
+});
+
+// Also stop screen share when leaving/ending session
+const origLeaveRoom = leaveRoom;
+// Patch endSession to also stop screen share
+const _origEndSession = endSession;
+function endSession() {
+  stopScreenShare();
+  _origEndSession();
+}
