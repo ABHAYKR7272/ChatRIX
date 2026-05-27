@@ -1481,30 +1481,6 @@ html, body {
   color: #ff2244;
 }
 
-/* Local panel overlay (camera switch on user's own video) */
-.duo-overlay.local-overlay {
-  top: 6px;
-  right: 6px;
-  opacity: 0.95;
-  z-index: 10;
-}
-.duo-overlay.local-overlay .duo-ctrl-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-}
-.duo-overlay.local-overlay .duo-ctrl-btn svg {
-  width: 14px;
-  height: 14px;
-}
-.duo-overlay.local-overlay .duo-ctrl-btn:active {
-  transform: scale(0.92);
-}
-.duo-overlay.local-overlay .duo-ctrl-btn.switching {
-  opacity: 0.5;
-  pointer-events: none;
-}
-
 /* Room wait screen hint text */
 .wait-hint {
   font-size: 0.7rem;
@@ -1958,3 +1934,22 @@ video {
     flex-shrink: 0;
   }
 }
+
+/* ═══ Screen Share Button ══════════════════════════════════ */
+.btn-screenshare {
+  color: #00ffff;
+  border-color: #00ffff44 !important;
+}
+.btn-screenshare.active {
+  background: #003333 !important;
+  border-color: #00ffff !important;
+  color: #00ffff !important;
+  box-shadow: 0 0 12px #00ffff55;
+  animation: share-pulse 1.5s ease-in-out infinite;
+}
+@keyframes share-pulse {
+  0%, 100% { box-shadow: 0 0 8px #00ffff55; }
+  50%       { box-shadow: 0 0 20px #00ffffaa; }
+}
+#ss-entire-screen:hover { background: #0d3333 !important; }
+#ss-single-app:hover    { background: #0d2233 !important; }
