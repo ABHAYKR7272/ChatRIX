@@ -1481,6 +1481,30 @@ html, body {
   color: #ff2244;
 }
 
+/* Local panel overlay (camera switch on user's own video) */
+.duo-overlay.local-overlay {
+  top: 6px;
+  right: 6px;
+  opacity: 0.95;
+  z-index: 10;
+}
+.duo-overlay.local-overlay .duo-ctrl-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+.duo-overlay.local-overlay .duo-ctrl-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.duo-overlay.local-overlay .duo-ctrl-btn:active {
+  transform: scale(0.92);
+}
+.duo-overlay.local-overlay .duo-ctrl-btn.switching {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
 /* Room wait screen hint text */
 .wait-hint {
   font-size: 0.7rem;
