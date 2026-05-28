@@ -60,6 +60,11 @@ const pendingOffers = {};
 
 let rebuildTimer = null;
 
+// ─── Screen Share state ──────────────────────────────────────────────────────
+let screenStream    = null;
+let screenAudioCtx  = null;
+let isScreenSharing = false;
+
 // ─── DOM shortcuts ───────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
@@ -1019,6 +1024,7 @@ async function startRoomSession(isRejoin = false) {
 
 // ─── Room cleanup ─────────────────────────────────────────────────────────────
 function cleanupRoom() {
+  if (isScreenSharing) stopScreenShare();
   closeAllRoomPeers();
   stopLocalMedia();
   currentRoomId    = null;
@@ -1074,6 +1080,7 @@ function toggleCamera() {
   showToast(isCamOff ? '📷 Camera off' : '📷 Camera on');
 }
 function skipStranger() {
+  if (isScreenSharing) stopScreenShare();
   closePeerConnection();
 
   // Reset all stranger-mode state
@@ -1124,6 +1131,7 @@ function skipStranger() {
   showScreen('waiting');
 }
 function endSession() {
+  if (isScreenSharing) stopScreenShare();
   closePeerConnection(); stopLocalMedia();
   if (socket) { socket.removeAllListeners(); socket.disconnect(); socket = null; }
   isMuted = false; isCamOff = false;
@@ -1163,6 +1171,216 @@ function toggleRoomCam() {
 function leaveRoom() {
   if (socket) { socket.removeAllListeners(); socket.disconnect(); socket = null; }
   cleanupRoom(); showScreen('landing');
+}
+
+// ─── Screen Share ─────────────────────────────────────────────────────────────
+function updateScreenShareBtns(active) {
+  ['btn-screen-share-stranger', 'btn-screen-share-room'].forEach(id => {
+    const btn = $(id);
+    if (!btn) return;
+    btn.classList.toggle('active', active);
+    const sp = btn.querySelector('span');
+    if (sp) sp.textContent = active ? 'STOP' : 'SHARE';
+    // Swap icon when active
+    const svg = btn.querySelector('svg');
+    if (svg) {
+      svg.style.color = active ? 'var(--green)' : '';
+    }
+  });
+}
+
+async function startScreenShare(displaySurface) {
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    showToast('⚠ Screen share not supported in this browser/app');
+    return;
+  }
+  if (isScreenSharing) { await stopScreenShare(); return; }
+
+  let captureStream;
+  try {
+    const videoConstraint = displaySurface
+      ? { displaySurface }
+      : true;
+    captureStream = await navigator.mediaDevices.getDisplayMedia({
+      video: videoConstraint,
+      audio: true,
+    });
+  } catch (e) {
+    showToast(e.name === 'NotAllowedError' ? '❌ Screen share cancelled' : '⚠ Screen share failed');
+    return;
+  }
+
+  const screenVideoTrack = captureStream.getVideoTracks()[0];
+  if (!screenVideoTrack) {
+    captureStream.getTracks().forEach(t => t.stop());
+    showToast('⚠ No screen video track obtained');
+    return;
+  }
+
+  screenStream = captureStream;
+  isScreenSharing = true;
+
+  // ── Mix mic + tab audio using Web Audio API ──────────────────────────────
+  let mixedAudioTrack = null;
+  try {
+    const screenAudioTracks = captureStream.getAudioTracks();
+    const micTracks = localStream ? localStream.getAudioTracks() : [];
+    if (screenAudioTracks.length > 0 || micTracks.length > 0) {
+      screenAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const dest = screenAudioCtx.createMediaStreamDestination();
+      if (micTracks.length > 0) {
+        const micSrc = screenAudioCtx.createMediaStreamSource(new MediaStream(micTracks));
+        micSrc.connect(dest);
+      }
+      if (screenAudioTracks.length > 0) {
+        const tabSrc = screenAudioCtx.createMediaStreamSource(new MediaStream(screenAudioTracks));
+        tabSrc.connect(dest);
+      }
+      mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
+    }
+  } catch (e) {
+    console.warn('[ScreenShare] audio mix error:', e);
+  }
+
+  // ── Replace tracks in all peer connections ───────────────────────────────
+  const replaceIn = async (pc) => {
+    try {
+      const senders = pc.getSenders();
+      const vSender = senders.find(s => s.track?.kind === 'video');
+      if (vSender) await vSender.replaceTrack(screenVideoTrack);
+      if (mixedAudioTrack) {
+        const aSender = senders.find(s => s.track?.kind === 'audio');
+        if (aSender) await aSender.replaceTrack(mixedAudioTrack);
+      }
+    } catch (e) { console.warn('[ScreenShare] replaceTrack:', e); }
+  };
+
+  if (peerConnection) await replaceIn(peerConnection);
+  for (const pc of Object.values(roomPeers)) await replaceIn(pc);
+
+  // Show screen in local preview
+  if (localVideo) localVideo.srcObject = captureStream;
+
+  // When user clicks browser's native "Stop sharing" button
+  screenVideoTrack.addEventListener('ended', () => {
+    if (isScreenSharing) stopScreenShare();
+  }, { once: true });
+
+  updateScreenShareBtns(true);
+  showToast('📺 Screen sharing — mic + screen audio mixed');
+}
+
+async function stopScreenShare() {
+  if (!isScreenSharing) return;
+  isScreenSharing = false;
+
+  if (screenStream) {
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
+  }
+  if (screenAudioCtx) {
+    try { await screenAudioCtx.close(); } catch {}
+    screenAudioCtx = null;
+  }
+
+  // Restore original camera + mic tracks
+  if (localStream) {
+    const vTrack = localStream.getVideoTracks()[0] || null;
+    const aTrack = localStream.getAudioTracks()[0] || null;
+    const restoreIn = async (pc) => {
+      try {
+        const senders = pc.getSenders();
+        if (vTrack) {
+          const vS = senders.find(s => s.track?.kind === 'video');
+          if (vS) await vS.replaceTrack(vTrack);
+        }
+        if (aTrack) {
+          const aS = senders.find(s => s.track?.kind === 'audio');
+          if (aS) await aS.replaceTrack(aTrack);
+        }
+      } catch (e) { console.warn('[ScreenShare] restore:', e); }
+    };
+    if (peerConnection) await restoreIn(peerConnection);
+    for (const pc of Object.values(roomPeers)) await restoreIn(pc);
+    if (localVideo) localVideo.srcObject = localStream;
+  }
+
+  updateScreenShareBtns(false);
+  showToast('📺 Screen sharing stopped');
+}
+
+function showScreenShareMenu(btnEl) {
+  // If already sharing, stop it
+  if (isScreenSharing) { stopScreenShare(); return; }
+
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    showToast('⚠ Screen share not supported in this browser/app');
+    return;
+  }
+
+  // Toggle: close if already open
+  const existing = document.getElementById('ss-popup');
+  if (existing) { existing.remove(); return; }
+
+  const menu = document.createElement('div');
+  menu.id = 'ss-popup';
+  menu.className = 'ss-popup';
+  menu.innerHTML = `
+    <div class="ss-title">// SCREEN SHARE //</div>
+    <button class="ss-opt" data-surface="monitor">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+        <line x1="8" y1="21" x2="16" y2="21"></line>
+        <line x1="12" y1="17" x2="12" y2="21"></line>
+      </svg>
+      <div class="ss-opt-text">
+        <div class="ss-opt-name">Entire Screen</div>
+        <div class="ss-opt-sub">Share your full display</div>
+      </div>
+    </button>
+    <button class="ss-opt" data-surface="browser">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+        <line x1="2" y1="7" x2="22" y2="7"></line>
+        <circle cx="5" cy="5" r="1" fill="currentColor"></circle>
+        <circle cx="8" cy="5" r="1" fill="currentColor"></circle>
+      </svg>
+      <div class="ss-opt-text">
+        <div class="ss-opt-name">App / Tab</div>
+        <div class="ss-opt-sub">Share a window or browser tab</div>
+      </div>
+    </button>
+    <div class="ss-note">⚡ Mic + tab audio mixed together</div>
+  `;
+  document.body.appendChild(menu);
+
+  // Position above the button
+  const rect = btnEl.getBoundingClientRect();
+  const menuW = 214;
+  let left = rect.left + rect.width / 2 - menuW / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - menuW - 8));
+  const bottom = window.innerHeight - rect.top + 10;
+  menu.style.cssText += `;left:${left}px;bottom:${bottom}px;width:${menuW}px;`;
+
+  menu.querySelectorAll('.ss-opt').forEach(opt => {
+    const handler = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const surface = opt.dataset.surface;
+      menu.remove();
+      startScreenShare(surface);
+    };
+    opt.addEventListener('click', handler);
+    opt.addEventListener('touchend', handler, { passive: false });
+  });
+
+  // Close on outside tap/click
+  const closeHandler = (e) => {
+    if (!menu.contains(e.target) && e.target !== btnEl) {
+      menu.remove();
+      document.removeEventListener('pointerdown', closeHandler, true);
+    }
+  };
+  setTimeout(() => document.addEventListener('pointerdown', closeHandler, true), 80);
 }
 
 // ─── Entry flows ──────────────────────────────────────────────────────────────
@@ -1257,6 +1475,18 @@ btnRoomCam.addEventListener('click',  toggleRoomCam);
 btnRoomLeave.addEventListener('click', leaveRoom);
 btnRoomSend.addEventListener('click',  sendRoomMsg);
 roomChatInput.addEventListener('keydown', e => { if (e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendRoomMsg();} });
+
+// ── Screen Share buttons ──────────────────────────────────────────────────────
+const btnSSStranger = $('btn-screen-share-stranger');
+const btnSSRoom     = $('btn-screen-share-room');
+if (btnSSStranger) {
+  btnSSStranger.addEventListener('click',    () => showScreenShareMenu(btnSSStranger));
+  btnSSStranger.addEventListener('touchend', (e) => { e.preventDefault(); showScreenShareMenu(btnSSStranger); }, { passive: false });
+}
+if (btnSSRoom) {
+  btnSSRoom.addEventListener('click',    () => showScreenShareMenu(btnSSRoom));
+  btnSSRoom.addEventListener('touchend', (e) => { e.preventDefault(); showScreenShareMenu(btnSSRoom); }, { passive: false });
+}
 
 $('modal-next').addEventListener('click', () => {
   hideModal(); closePeerConnection(); showScreen('waiting');
