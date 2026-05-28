@@ -1174,6 +1174,15 @@ function leaveRoom() {
 }
 
 // ─── Screen Share ─────────────────────────────────────────────────────────────
+// Works in 2 modes:
+//   1. Android APK  → uses window.AndroidBridge (native MediaProjection via canvas frames)
+//   2. Desktop/Chrome mobile browser → uses getDisplayMedia()
+
+// Android canvas state
+let _androidCanvas      = null;
+let _androidCanvasCtx   = null;
+let _androidCanvasStream = null;
+
 function updateScreenShareBtns(active) {
   ['btn-screen-share-stranger', 'btn-screen-share-room'].forEach(id => {
     const btn = $(id);
@@ -1181,28 +1190,105 @@ function updateScreenShareBtns(active) {
     btn.classList.toggle('active', active);
     const sp = btn.querySelector('span');
     if (sp) sp.textContent = active ? 'STOP' : 'SHARE';
-    // Swap icon when active
-    const svg = btn.querySelector('svg');
-    if (svg) {
-      svg.style.color = active ? 'var(--green)' : '';
-    }
   });
 }
 
-async function startScreenShare(displaySurface) {
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    showToast('⚠ Screen share not supported in this browser/app');
-    return;
-  }
-  if (isScreenSharing) { await stopScreenShare(); return; }
+// Replace video (and optionally audio) track in all peer connections
+async function _replaceVideoTrack(vTrack, aTrack) {
+  const replaceIn = async (pc) => {
+    try {
+      const senders = pc.getSenders();
+      if (vTrack) {
+        const vS = senders.find(s => s.track?.kind === 'video');
+        if (vS) await vS.replaceTrack(vTrack);
+      }
+      if (aTrack) {
+        const aS = senders.find(s => s.track?.kind === 'audio');
+        if (aS) await aS.replaceTrack(aTrack);
+      }
+    } catch (e) { console.warn('[SS] replaceTrack:', e); }
+  };
+  if (peerConnection) await replaceIn(peerConnection);
+  for (const pc of Object.values(roomPeers)) await replaceIn(pc);
+}
 
+// ── Android APK path (native MediaProjection → JPEG frames → Canvas → WebRTC) ─
+function _startAndroidScreenShare() {
+  // Set up canvas that receives JPEG frames from Android
+  _androidCanvas    = document.createElement('canvas');
+  _androidCanvas.width  = 720;
+  _androidCanvas.height = 1280;
+  _androidCanvasCtx = _androidCanvas.getContext('2d');
+
+  // Capture a MediaStream from the canvas (15 fps max)
+  _androidCanvasStream = _androidCanvas.captureStream(15);
+
+  let tracksReplaced = false;
+
+  // Called by Android for every captured frame
+  window.onAndroidScreenFrame = (dataUrl) => {
+    const img = new Image();
+    img.onload = () => {
+      if (_androidCanvas.width  !== img.naturalWidth ||
+          _androidCanvas.height !== img.naturalHeight) {
+        _androidCanvas.width  = img.naturalWidth;
+        _androidCanvas.height = img.naturalHeight;
+      }
+      _androidCanvasCtx.drawImage(img, 0, 0);
+
+      // After first real frame: hook into WebRTC
+      if (!tracksReplaced) {
+        tracksReplaced = true;
+        isScreenSharing = true;
+        screenStream    = _androidCanvasStream;
+
+        const vTrack = _androidCanvasStream.getVideoTracks()[0] || null;
+        // Keep using localStream's audio (mic stays on)
+        _replaceVideoTrack(vTrack, null);
+
+        if (localVideo) localVideo.srcObject = _androidCanvasStream;
+        updateScreenShareBtns(true);
+        showToast('📺 Screen sharing started (Android)');
+      }
+    };
+    img.src = dataUrl;
+  };
+
+  window.onAndroidScreenShareDenied = () => {
+    showToast('❌ Screen share permission denied');
+    _cleanupAndroidCanvas();
+  };
+
+  window.onAndroidScreenShareStopped = () => {
+    if (isScreenSharing) stopScreenShare();
+  };
+
+  // Ask Android to start screen capture
+  try { window.AndroidBridge.requestScreenShare(); } catch (e) {
+    showToast('⚠ Android bridge error: ' + e.message);
+    _cleanupAndroidCanvas();
+  }
+  showToast('📱 Requesting screen permission…');
+}
+
+function _cleanupAndroidCanvas() {
+  if (_androidCanvasStream) {
+    _androidCanvasStream.getTracks().forEach(t => t.stop());
+    _androidCanvasStream = null;
+  }
+  _androidCanvas    = null;
+  _androidCanvasCtx = null;
+  window.onAndroidScreenFrame        = null;
+  window.onAndroidScreenShareDenied  = null;
+  window.onAndroidScreenShareStopped = null;
+}
+
+// ── Browser path (getDisplayMedia — desktop & Chrome mobile) ──────────────────
+async function _startBrowserScreenShare(displaySurface) {
   let captureStream;
   try {
-    const videoConstraint = displaySurface
-      ? { displaySurface }
-      : true;
     captureStream = await navigator.mediaDevices.getDisplayMedia({
-      video: videoConstraint,
+      video: displaySurface ? { displaySurface } : true,
       audio: true,
     });
   } catch (e) {
@@ -1213,14 +1299,14 @@ async function startScreenShare(displaySurface) {
   const screenVideoTrack = captureStream.getVideoTracks()[0];
   if (!screenVideoTrack) {
     captureStream.getTracks().forEach(t => t.stop());
-    showToast('⚠ No screen video track obtained');
+    showToast('⚠ No screen video track');
     return;
   }
 
-  screenStream = captureStream;
+  screenStream    = captureStream;
   isScreenSharing = true;
 
-  // ── Mix mic + tab audio using Web Audio API ──────────────────────────────
+  // Mix mic + tab audio
   let mixedAudioTrack = null;
   try {
     const screenAudioTracks = captureStream.getAudioTracks();
@@ -1228,52 +1314,57 @@ async function startScreenShare(displaySurface) {
     if (screenAudioTracks.length > 0 || micTracks.length > 0) {
       screenAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const dest = screenAudioCtx.createMediaStreamDestination();
-      if (micTracks.length > 0) {
-        const micSrc = screenAudioCtx.createMediaStreamSource(new MediaStream(micTracks));
-        micSrc.connect(dest);
-      }
-      if (screenAudioTracks.length > 0) {
-        const tabSrc = screenAudioCtx.createMediaStreamSource(new MediaStream(screenAudioTracks));
-        tabSrc.connect(dest);
-      }
+      if (micTracks.length > 0)
+        screenAudioCtx.createMediaStreamSource(new MediaStream(micTracks)).connect(dest);
+      if (screenAudioTracks.length > 0)
+        screenAudioCtx.createMediaStreamSource(new MediaStream(screenAudioTracks)).connect(dest);
       mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
     }
-  } catch (e) {
-    console.warn('[ScreenShare] audio mix error:', e);
-  }
+  } catch (e) { console.warn('[SS] audio mix:', e); }
 
-  // ── Replace tracks in all peer connections ───────────────────────────────
-  const replaceIn = async (pc) => {
-    try {
-      const senders = pc.getSenders();
-      const vSender = senders.find(s => s.track?.kind === 'video');
-      if (vSender) await vSender.replaceTrack(screenVideoTrack);
-      if (mixedAudioTrack) {
-        const aSender = senders.find(s => s.track?.kind === 'audio');
-        if (aSender) await aSender.replaceTrack(mixedAudioTrack);
-      }
-    } catch (e) { console.warn('[ScreenShare] replaceTrack:', e); }
-  };
+  await _replaceVideoTrack(screenVideoTrack, mixedAudioTrack);
 
-  if (peerConnection) await replaceIn(peerConnection);
-  for (const pc of Object.values(roomPeers)) await replaceIn(pc);
-
-  // Show screen in local preview
   if (localVideo) localVideo.srcObject = captureStream;
 
-  // When user clicks browser's native "Stop sharing" button
+  // Auto-stop when browser's "Stop sharing" button is clicked
   screenVideoTrack.addEventListener('ended', () => {
     if (isScreenSharing) stopScreenShare();
   }, { once: true });
 
   updateScreenShareBtns(true);
-  showToast('📺 Screen sharing — mic + screen audio mixed');
+  showToast('📺 Sharing — mic + screen audio mixed');
 }
 
+// ── Public entry point ────────────────────────────────────────────────────────
+async function startScreenShare(displaySurface) {
+  if (isScreenSharing) { await stopScreenShare(); return; }
+
+  // Android APK: use native bridge
+  if (window.AndroidBridge) {
+    _startAndroidScreenShare();
+    return;
+  }
+
+  // Browser: use getDisplayMedia
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    showToast('⚠ Screen share not supported in this browser');
+    return;
+  }
+  await _startBrowserScreenShare(displaySurface);
+}
+
+// ── Stop screen share (both paths) ────────────────────────────────────────────
 async function stopScreenShare() {
   if (!isScreenSharing) return;
   isScreenSharing = false;
 
+  // Android cleanup
+  if (window.AndroidBridge) {
+    try { window.AndroidBridge.stopScreenShare(); } catch {}
+    _cleanupAndroidCanvas();
+  }
+
+  // Browser cleanup
   if (screenStream) {
     screenStream.getTracks().forEach(t => t.stop());
     screenStream = null;
@@ -1287,21 +1378,7 @@ async function stopScreenShare() {
   if (localStream) {
     const vTrack = localStream.getVideoTracks()[0] || null;
     const aTrack = localStream.getAudioTracks()[0] || null;
-    const restoreIn = async (pc) => {
-      try {
-        const senders = pc.getSenders();
-        if (vTrack) {
-          const vS = senders.find(s => s.track?.kind === 'video');
-          if (vS) await vS.replaceTrack(vTrack);
-        }
-        if (aTrack) {
-          const aS = senders.find(s => s.track?.kind === 'audio');
-          if (aS) await aS.replaceTrack(aTrack);
-        }
-      } catch (e) { console.warn('[ScreenShare] restore:', e); }
-    };
-    if (peerConnection) await restoreIn(peerConnection);
-    for (const pc of Object.values(roomPeers)) await restoreIn(pc);
+    await _replaceVideoTrack(vTrack, aTrack);
     if (localVideo) localVideo.srcObject = localStream;
   }
 
@@ -1309,16 +1386,21 @@ async function stopScreenShare() {
   showToast('📺 Screen sharing stopped');
 }
 
+// ── Popup menu (shown on button click) ───────────────────────────────────────
 function showScreenShareMenu(btnEl) {
-  // If already sharing, stop it
   if (isScreenSharing) { stopScreenShare(); return; }
 
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    showToast('⚠ Screen share not supported in this browser/app');
+  // Android: no menu needed — just one option (whole screen)
+  if (window.AndroidBridge) {
+    startScreenShare(null);
     return;
   }
 
-  // Toggle: close if already open
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    showToast('⚠ Screen share not supported in this browser');
+    return;
+  }
+
   const existing = document.getElementById('ss-popup');
   if (existing) { existing.remove(); return; }
 
@@ -1350,30 +1432,27 @@ function showScreenShareMenu(btnEl) {
         <div class="ss-opt-sub">Share a window or browser tab</div>
       </div>
     </button>
-    <div class="ss-note">⚡ Mic + tab audio mixed together</div>
+    <div class="ss-note">⚡ Mic + tab audio mixed</div>
   `;
   document.body.appendChild(menu);
 
-  // Position above the button
-  const rect = btnEl.getBoundingClientRect();
+  const rect  = btnEl.getBoundingClientRect();
   const menuW = 214;
-  let left = rect.left + rect.width / 2 - menuW / 2;
-  left = Math.max(8, Math.min(left, window.innerWidth - menuW - 8));
+  let left    = rect.left + rect.width / 2 - menuW / 2;
+  left        = Math.max(8, Math.min(left, window.innerWidth - menuW - 8));
   const bottom = window.innerHeight - rect.top + 10;
   menu.style.cssText += `;left:${left}px;bottom:${bottom}px;width:${menuW}px;`;
 
   menu.querySelectorAll('.ss-opt').forEach(opt => {
     const handler = (e) => {
       e.preventDefault(); e.stopPropagation();
-      const surface = opt.dataset.surface;
       menu.remove();
-      startScreenShare(surface);
+      startScreenShare(opt.dataset.surface);
     };
     opt.addEventListener('click', handler);
     opt.addEventListener('touchend', handler, { passive: false });
   });
 
-  // Close on outside tap/click
   const closeHandler = (e) => {
     if (!menu.contains(e.target) && e.target !== btnEl) {
       menu.remove();
